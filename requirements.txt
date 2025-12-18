@@ -1,4 +1,6 @@
 azure-functions
-azure-storage-blob
+requests
 pandas
+azure-storage-blob
+python-dateutil
 openpyxl
