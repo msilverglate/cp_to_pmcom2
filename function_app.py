@@ -628,17 +628,25 @@ def run_cp_to_pmcom(filters=None, allowed_statuses=None, debug=False):
 # =====================
 app = func.FunctionApp()
 
-
 @app.function_name(name="cp_to_pmcom_main2")
-@app.schedule(schedule="0 0 * * *", arg_name="timer", run_on_startup=True)
-def cp_to_pmcom_main2(timer: func.TimerRequest):
+@app.route(route="cp_to_pmcom_main2", methods=["POST", "GET"])  # HTTP trigger
+def cp_to_pmcom_main2(req: func.HttpRequest):
 
-    run_cp_to_pmcom(
-        filters=None,
-        allowed_statuses=None,
-        debug=False
-    )
+    filters = None
+    allowed_statuses = None
+    debug = False
 
+    # optional: read query params or JSON payload
+    if req.method == "POST":
+        data = req.get_json()
+        filters = data.get("filters")
+        allowed_statuses = data.get("allowed_statuses")
+        debug = data.get("debug", False)
+
+    run_cp_to_pmcom(filters=filters, allowed_statuses=allowed_statuses, debug=debug)
+
+    return func.HttpResponse("CP to PMCOM processing triggered successfully.", status_code=200)
+    
 if __name__ == "__main__":
 
     data_dict = load_data_dictionary()
