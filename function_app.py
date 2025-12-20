@@ -274,6 +274,15 @@ def load_data_dictionary():
             return {}
 
 
+def get_available_filter_fields():
+    data_dict = load_data_dictionary()
+    df = read_excel_from_blob("blob1", "Project Data 1.xlsx")
+
+    cp_columns = list(df.columns)
+    # all_fields = sorted(set(list(data_dict.keys()) + cp_columns))
+
+    return cp_columns
+
 def get_project_status(response_json):
     """
     Extracts the project status name ("Open", "Closed", etc.)
@@ -557,25 +566,19 @@ def update_pmcom_matching_projects(projects, data_dict, allowed_statuses, debug=
 
 def run_cp_to_pmcom(filters=None, allowed_statuses=None, debug=False):
 
-    # -------- Start timestamp --------
-    print("\n===================")
-    print(f"Script run started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("===================\n")
 
-    data_dict = load_data_dictionary()
+    # # =====================
+    # # LOAD CP EXCEL COLUMNS FOR HELP
+    # # =====================
+    # # excel_file = r"C:\Users\mike.silverglate\OneDrive - Red River Technology LLC\Documents\2025 04 Apr\Project Data 1.xlsx"
+    # df = read_excel_from_blob("blob1", "Project Data 1.xlsx")
+    # print(f"Loaded CP file from blob with {len(df.columns)} columns")
+    # # df = pd.read_excel(excel_file)
+    # cp_columns = list(df.columns)
 
-    # =====================
-    # LOAD CP EXCEL COLUMNS FOR HELP
-    # =====================
-    # excel_file = r"C:\Users\mike.silverglate\OneDrive - Red River Technology LLC\Documents\2025 04 Apr\Project Data 1.xlsx"
-    df = read_excel_from_blob("blob1", "Project Data 1.xlsx")
-    print(f"Loaded CP file from blob with {len(df.columns)} columns")
-    # df = pd.read_excel(excel_file)
-    cp_columns = list(df.columns)
-
-    # Merge with data dictionary keys
-    all_fields = sorted(set(list(data_dict.keys()) + cp_columns))
-    # all_fields_text = ", ".join(all_fields)
+    # # Merge with data dictionary keys
+    # all_fields = sorted(set(list(data_dict.keys()) + cp_columns))
+    # # all_fields_text = ", ".join(all_fields)
 
     # =====================
     # LOGGING SETUP
@@ -588,6 +591,17 @@ def run_cp_to_pmcom(filters=None, allowed_statuses=None, debug=False):
 
     print("This log will go to both console and blob!")
     print("Processing project data...")
+
+    
+    # -------- Start timestamp --------
+    print("\n===================")
+    print(f"Script run started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("===================\n")
+
+    data_dict = load_data_dictionary()
+    print("Allowed Statuses", allowed_statuses)
+    print("Filters", filters)
+    print("Debug", debug)
 
     # =====================
     # DEFAULT BEHAVIOR (NO CONFIG / IDE RUN)
@@ -630,22 +644,62 @@ app = func.FunctionApp()
 
 @app.function_name(name="cp_to_pmcom_main2")
 @app.route(route="cp_to_pmcom_main2", methods=["POST", "GET"])  # HTTP trigger
+
 def cp_to_pmcom_main2(req: func.HttpRequest):
 
-    filters = None
-    allowed_statuses = None
-    debug = False
+    # -------------------------
+    # GET → describe function
+    # -------------------------
+    if req.method == "GET":
+        fields = get_available_filter_fields()
 
-    # optional: read query params or JSON payload
+        return func.HttpResponse(
+            json.dumps({
+                "description": "Update PM.com projects from CP Excel feed",
+                "available_filters": fields,
+                "filter_syntax": "FieldName=Value or FieldName=%partial%",
+                "examples": {
+                    "filters": [
+                        "Project Manager Name=%Lendo%",
+                        "Opportunity ID=0140045"
+                    ],
+                    "allowed_statuses": [
+                        "Open",
+                        "Planning",
+                        "Bucket of Hours"
+                    ]
+                },
+                "defaults": {
+                    "allowed_statuses": [
+                        "Open",
+                        "Planning",
+                        "Bucket of Hours"
+                    ],
+                    "debug": False
+                }
+            }, indent=2),
+            mimetype="application/json",
+            status_code=200
+        )
+
+     # optional: read query params or JSON payload
     if req.method == "POST":
         data = req.get_json()
         filters = data.get("filters")
         allowed_statuses = data.get("allowed_statuses")
         debug = data.get("debug", False)
 
-    run_cp_to_pmcom(filters=filters, allowed_statuses=allowed_statuses, debug=debug)
+    run_cp_to_pmcom(
+        filters=filters,
+        allowed_statuses=allowed_statuses,
+        debug=debug
+    )
 
-    return func.HttpResponse("CP to PMCOM processing triggered successfully.", status_code=200)
+    return func.HttpResponse(
+        "CP to PMCOM processing triggered successfully.",
+        status_code=200
+    )
+
     
 if __name__ == "__main__":
 
