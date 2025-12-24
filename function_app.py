@@ -1,4 +1,3 @@
-
 import requests
 import pandas as pd
 from datetime import datetime, timedelta
@@ -9,8 +8,9 @@ import os
 import io
 import argparse
 import azure.functions as func
-
-
+import numpy as np
+import smartsheet
+import logging
 
 #----------Azure Blob Connection --------
 
@@ -84,7 +84,7 @@ API_KEY = os.environ.get("API_KEY")
 if not API_KEY:
     raise RuntimeError("Set API_KEY_PM in environment first!")
 BASE_URL = "https://api.projectmanager.com/api/data"
-STORAGE_ACCOUNT_KEY = os.environ.get("AZURE_STORAGE_KEY")
+# STORAGE_ACCOUNT_KEY = os.environ.get("AZURE_STORAGE_KEY")
 
 headers = {
     "Authorization": f"Bearer {API_KEY}",
@@ -642,10 +642,10 @@ def run_cp_to_pmcom(filters=None, allowed_statuses=None, debug=False):
 # =====================
 app = func.FunctionApp()
 
-@app.function_name(name="cp_to_pmcom_main2")
-@app.route(route="cp_to_pmcom_main2", methods=["POST", "GET"])  # HTTP trigger
+@app.function_name(name="CostpointToPMcom")
+@app.route(route="CostpointToPMcom", methods=["POST", "GET"])  # HTTP trigger
 
-def cp_to_pmcom_main2(req: func.HttpRequest):
+def CostpointToPMcom(req: func.HttpRequest):
 
     # -------------------------
     # GET → describe function
@@ -700,6 +700,153 @@ def cp_to_pmcom_main2(req: func.HttpRequest):
         status_code=200
     )
 
+
+# =====================
+# SMARTSHEET IMPORT 
+# =====================
+
+
+# Config from environment
+SMARTSHEET_API_KEY = os.environ.get("SMARTSHEET_API_KEY")
+print('SMARTSHEET_API_KEY',SMARTSHEET_API_KEY)
+if not SMARTSHEET_API_KEY:
+    raise ValueError("SMARTSHEET_API_KEY is missing")
+
+# Smartsheet
+SHEET_ID = os.environ.get("SMARTSHEET_SHEET_ID")
+print('SHEET_ID', SHEET_ID)
+if not SHEET_ID:
+    raise ValueError("SMARTSHEET_SHEET_ID environment variable is missing")
+
+
+# # Logging
+# logger = logging.getLogger("cp_to_smartsheet")
+# logger.setLevel(logging.INFO)
+
+
+def clear_smartsheet(sheet,smartsheet_client):
+    row_ids = [row.id for row in sheet.rows]
+    total_rows = len(row_ids)
+    print(f"Starting to clear {total_rows} rows from Smartsheet...")
+
+    CHUNK_SIZE = 400
+    deleted_count = 0
+
+    for i in range(0, total_rows, CHUNK_SIZE):
+        chunk = row_ids[i:i + CHUNK_SIZE]
+        smartsheet_client.Sheets.delete_rows(sheet.id, chunk)
+        deleted_count += len(chunk)
+        print(f"Deleted {len(chunk)} rows in this chunk. Total deleted so far: {deleted_count}/{total_rows}")
+
+    print(f"Completed clearing rows. Total deleted: {deleted_count}")
+
+def reduce_columns(df, allowed_columns):
+    df1 = df[sorted(allowed_columns)].copy()
+    for col in ["PJ UDEF Date 1", "End Date", "Project Start Date"]:
+        if col in df1.columns:
+            df1[col] = df1[col].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    df1.replace({np.nan: ""}, inplace=True)
+    return df1
+
+
+def run_cp_to_smartsheet():
+
+    # -----------------------------
+    # SET UP BLOB CLIENT (like PMCOM)
+    # -----------------------------
+            
+    BLOB_CONTAINER = os.environ.get("BLOB_CONTAINER_NAME", "blob1")
+    BLOB_NAME = "Project Data 1.xlsx"
+    blob_name_input = BLOB_NAME
+    STORAGE_CONN_STR = os.environ["AzureWebJobsStorage"]
+
+    blob_service_client = BlobServiceClient.from_connection_string(STORAGE_CONN_STR)
+
+
+    # -----------------------------
+    # SET UP BLOB LOGGING (like PMCOM)
+    # -----------------------------
+
+    container = BLOB_CONTAINER
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    blob_name_log = f"smartsheet_update_log_{timestamp}.txt"
+
+    tee = BlobTee(container, blob_name_log)
+    original_stdout = sys.stdout
+    sys.stdout = tee
+    
+    # Smartsheet Client 
+    smartsheet_client = smartsheet.Smartsheet(SMARTSHEET_API_KEY)
+
+    try:
+        print("=== Smartsheet Sync Started ===")
+        print(f"Start time: {datetime.now()}")
+
+        df = read_excel_from_blob(container, blob_name_input)
+        print(f"Loaded CP Excel with {len(df)} rows")
+
+        sheet = smartsheet_client.Sheets.get_sheet(SHEET_ID)
+        print(f"Loaded Smartsheet '{sheet.name}' with {len(sheet.rows)} existing rows")
+
+        clear_smartsheet(sheet, smartsheet_client)
+
+        smartsheet_columns = [c.title for c in sheet.columns]
+        common_columns = list(set(smartsheet_columns).intersection(df.columns))
+        print(f"Matched columns ({len(common_columns)}): {common_columns}")
+
+        df1 = reduce_columns(df, common_columns)
+
+        rows = []
+        ROW_LIMIT = 20000
+
+        for idx, row in df1.iterrows():
+            if idx >= ROW_LIMIT:
+                break
+
+            new_row = smartsheet.models.Row()
+            new_row.to_bottom = True
+
+            for col in sheet.columns:
+                if col.title in df1.columns:
+                    new_row.cells.append({
+                        "column_id": col.id,
+                        "value": row[col.title]
+                    })
+
+            rows.append(new_row)
+
+            if (idx + 1) % 100 == 0:
+                print(f"Prepared {idx + 1} rows")
+
+        if rows:
+            print(f"Writing {len(rows)} rows to Smartsheet")
+            smartsheet_client.Sheets.add_rows(SHEET_ID, rows)
+
+        print("=== Smartsheet Sync Completed Successfully ===")
+
+    except Exception as e:
+        print("❌ Smartsheet sync FAILED")
+        print(str(e))
+        raise
+
+    finally:
+        print(f"End time: {datetime.now()}")
+        tee.upload_to_blob()
+        sys.stdout = original_stdout
+
+
+# HTTP trigger function
+@app.function_name(name="CostpointToSmartsheet")
+@app.route(route="CostpointToSmartsheet", methods=["POST"])
+def CostpointToSmartsheet(req: func.HttpRequest):
+    print("CP → Smartsheet function triggered")
+    try:
+        run_cp_to_smartsheet()
+        return func.HttpResponse("Costpoint to Smartsheet completed successfully", status_code=200)
+    except Exception as e:
+        print("Unhandled exception")
+        return func.HttpResponse(f"Error: {str(e)}", status_code=500)
+
     
 if __name__ == "__main__":
 
@@ -719,7 +866,7 @@ if __name__ == "__main__":
     # ARGPARSE WITH UPDATED HELP
     # =====================
     parser = argparse.ArgumentParser(
-        description=f"Update PM.com projects from CP Excel feed.\n\n"
+        description=f"Update PM.com projects and Smartsheet from CP Excel feed.\n\n"
                     f"Available fields for filtering:\n  {all_fields_text}\n\n"
                     f"Examples:\n"
                     f'  --filter "Project Manager Name=%%Lendo%%"\n'
@@ -737,9 +884,15 @@ if __name__ == "__main__":
     if not args.newlog:
         args.newlog = True
 
-    run_cp_to_pmcom(
-        filters=args.filter,
-        allowed_statuses=args.allowed_status,
-        debug=args.debug
-    )
+    # =====================
+    # RUN PMCOM UPDATE
+    # =====================
+    run_cp_to_pmcom()
 
+    # =====================
+    # RUN SMARTSHEET UPDATE
+    # =====================
+    try:
+        run_cp_to_smartsheet()
+    except Exception as e:
+        print(f"❌ Smartsheet update failed: {e}")

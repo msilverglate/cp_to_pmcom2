@@ -1,6 +1,7 @@
 azure-functions
-requests
-pandas
 azure-storage-blob
-python-dateutil
+pandas
+numpy
+requests
+smartsheet-python-sdk
 openpyxl
