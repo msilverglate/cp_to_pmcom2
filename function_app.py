@@ -16,13 +16,11 @@ from azure.storage.blob import BlobServiceClient
 # CONFIG
 # =====================
 
-BLOB_CONTAINER = os.environ.get("BLOB_CONTAINER_NAME", "blob1")
+BLOB_CONTAINER = os.environ.get("BLOB_BLOB_CONTAINER", "blob1")
 BLOB_NAME = os.environ.get("BLOB_NAME", "Project Data 1.xlsx")
 STORAGE_CONN_STR = os.environ["AzureWebJobsStorage"]
 
 # Azure blob info to variables
-connect_str = STORAGE_CONN_STR
-container_name = BLOB_CONTAINER
 blob_name = BLOB_NAME
 
 BASE_URL = "https://api.projectmanager.com/api/data"
@@ -37,25 +35,25 @@ headers = {
 }
 
 
-def read_excel_from_blob(container_name, blob_name):
+def read_excel_from_blob(BLOB_CONTAINER, blob_name):
     """
     Downloads an Excel file from Azure Blob Storage and returns a pandas DataFrame.
     Checks for container and blob existence before reading.
     """
-    if not connect_str:
+    if not STORAGE_CONN_STR:
         raise RuntimeError("Set AZURE_STORAGE_CONNECTION_STRING environment variable first!")
 
-    blob_service_client = BlobServiceClient.from_connection_string(connect_str)
-    container_client = blob_service_client.get_container_client(container_name)
+    blob_service_client = BlobServiceClient.from_connection_string(STORAGE_CONN_STR)
+    container_client = blob_service_client.get_container_client(BLOB_CONTAINER)
 
     if not container_client.exists():
-        raise RuntimeError(f"Container '{container_name}' does not exist!")
+        raise RuntimeError(f"Container '{BLOB_CONTAINER}' does not exist!")
 
     blob_client = container_client.get_blob_client(blob_name)
     if not blob_client.exists():
-        raise RuntimeError(f"Blob '{blob_name}' does not exist in container '{container_name}'!")
+        raise RuntimeError(f"Blob '{blob_name}' does not exist in container '{BLOB_CONTAINER}'!")
 
-    print(f"✅ Connected to blob: {container_name}/{blob_name}")
+    print(f"✅ Connected to blob: {BLOB_CONTAINER}/{blob_name}")
 
     # Download blob into memory and read with pandas
     blob_data = blob_client.download_blob().readall()
@@ -68,8 +66,8 @@ def read_excel_from_blob(container_name, blob_name):
 # -----------------------------
 class BlobTee:
     """Redirects prints to console and in-memory buffer."""
-    def __init__(self, container_name, blob_name):
-        self.container_name = container_name
+    def __init__(self, BLOB_CONTAINER, blob_name):
+        self.BLOB_CONTAINER = BLOB_CONTAINER
         self.blob_name = blob_name
         self.buffer = io.StringIO()
         self._stdout = sys.__stdout__  # <-- original stdout
@@ -83,17 +81,17 @@ class BlobTee:
         self.buffer.flush()
 
     def upload_to_blob(self):
-        if not connect_str:
+        if not STORAGE_CONN_STR:
             raise RuntimeError("AZURE_STORAGE_CONNECTION_STRING not set!")
 
-        blob_service_client = BlobServiceClient.from_connection_string(connect_str)
-        container_client = blob_service_client.get_container_client(self.container_name)
+        blob_service_client = BlobServiceClient.from_connection_string(STORAGE_CONN_STR)
+        container_client = blob_service_client.get_container_client(self.BLOB_CONTAINER)
         if not container_client.exists():
             container_client.create_container()
 
         blob_client = container_client.get_blob_client(self.blob_name)
         blob_client.upload_blob(self.buffer.getvalue(), overwrite=True)
-        self._stdout.write(f"\n✅ Uploaded log to blob: {self.container_name}/{self.blob_name}\n")
+        self._stdout.write(f"\n✅ Uploaded log to blob: {self.BLOB_CONTAINER}/{self.blob_name}\n")
 
 # === DATA DICTIONARY ===
 
@@ -231,7 +229,7 @@ def load_data_dictionary():
 
     try:
         # Attempt to load from Azure blob
-        df = read_excel_from_blob(container_name, blob_dict_name)
+        df = read_excel_from_blob(BLOB_CONTAINER, blob_dict_name)
 
         # Clean column names
         df.columns = [c.strip() for c in df.columns]
@@ -278,7 +276,7 @@ def load_data_dictionary():
 
 def get_available_filter_fields():
     data_dict = load_data_dictionary()
-    df = read_excel_from_blob(container_name, blob_name)
+    df = read_excel_from_blob(BLOB_CONTAINER, blob_name)
 
     cp_columns = list(df.columns)
 
@@ -311,7 +309,7 @@ def get_project_status(response_json):
 def readCP_File(data_dict, filters=None, debug=False):
 
     # Load Excel from blob
-    df = read_excel_from_blob(container_name, blob_name)
+    df = read_excel_from_blob(BLOB_CONTAINER, blob_name)
 
     df["PJ UDEF Date 1"] = pd.to_datetime(df["PJ UDEF Date 1"], errors="coerce")
     threshold_date = datetime.now() - timedelta(days=30)
@@ -571,7 +569,7 @@ def run_cp_to_pmcom(filters=None, allowed_statuses=None, debug=False):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     blob_name_log = f"pm_update_log_{timestamp}.txt"
 
-    sys.stdout = BlobTee(container_name, blob_name_log)
+    sys.stdout = BlobTee(BLOB_CONTAINER, blob_name_log)
 
     print("This log will go to both console and blob!")
     print("Processing project data...")
@@ -697,9 +695,9 @@ if not SMARTSHEET_API_KEY:
     raise ValueError("SMARTSHEET_API_KEY is missing")
 
 # Smartsheet
-SHEET_ID = os.environ.get("SMARTSHEET_SHEET_ID")
-print('SHEET_ID', SHEET_ID)
-if not SHEET_ID:
+SMARTSHEET_SHEET_ID = os.environ.get("SMARTSHEET_SHEET_ID")
+print('SMARTSHEET_SHEET_ID', SMARTSHEET_SHEET_ID)
+if not SMARTSHEET_SHEET_ID:
     raise ValueError("SMARTSHEET_SHEET_ID environment variable is missing")
     # Smartsheet Client 
 
@@ -709,7 +707,7 @@ smartsheet_client = smartsheet.Smartsheet(SMARTSHEET_API_KEY)
 # SET UP BLOB CLIENT (like PMCOM)
 # -----------------------------
         
-blob_service_client = BlobServiceClient.from_connection_string(connect_str)
+blob_service_client = BlobServiceClient.from_connection_string(STORAGE_CONN_STR)
 
 
 def clear_smartsheet(sheet):
@@ -737,7 +735,15 @@ def reduce_columns(df, allowed_columns):
     return df1
 
 
-def run_cp_to_smartsheet():
+def run_cp_to_smartsheet(
+    sheet_id: int | None = SMARTSHEET_SHEET_ID,
+    blob_name: str | None = BLOB_NAME,
+):
+    # -----------------------------
+    # RESOLVE DEFAULTS
+    # -----------------------------
+    # sheet_id = sheet_id or SMARTSHEET_SHEET_ID
+    # blob_name = blob_name or BLOB_NAME
 
     # -----------------------------
     # SET UP BLOB LOGGING (like PMCOM)
@@ -746,7 +752,7 @@ def run_cp_to_smartsheet():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     blob_name_log = f"smartsheet_update_log_{timestamp}.txt"
 
-    tee = BlobTee(container_name, blob_name_log)
+    tee = BlobTee(BLOB_CONTAINER, blob_name_log)
     original_stdout = sys.stdout
     sys.stdout = tee
     
@@ -754,10 +760,10 @@ def run_cp_to_smartsheet():
         print("=== Smartsheet Sync Started ===")
         print(f"Start time: {datetime.now()}")
 
-        df = read_excel_from_blob(container_name, blob_name)
+        df = read_excel_from_blob(BLOB_CONTAINER, blob_name)
         print(f"Loaded CP Excel with {len(df)} rows")
 
-        sheet = smartsheet_client.Sheets.get_sheet(SHEET_ID)
+        sheet = smartsheet_client.Sheets.get_sheet(sheet_id)
         print(f"Loaded Smartsheet '{sheet.name}' with {len(sheet.rows)} existing rows")
 
         clear_smartsheet(sheet)
@@ -792,7 +798,7 @@ def run_cp_to_smartsheet():
 
         if rows:
             print(f"Writing {len(rows)} rows to Smartsheet")
-            smartsheet_client.Sheets.add_rows(SHEET_ID, rows)
+            smartsheet_client.Sheets.add_rows(sheet_id, rows)
 
         print("=== Smartsheet Sync Completed Successfully ===")
 
@@ -807,7 +813,7 @@ def run_cp_to_smartsheet():
         sys.stdout = original_stdout
 
 
-# HTTP trigger function
+# HTTP trigger CostpointToSmartsheet A1 function
 @app.function_name(name="CostpointToSmartsheet")
 @app.route(route="CostpointToSmartsheet", methods=["POST"])
 def CostpointToSmartsheet(req: func.HttpRequest):
@@ -819,7 +825,22 @@ def CostpointToSmartsheet(req: func.HttpRequest):
         print("Unhandled exception")
         return func.HttpResponse(f"Error: {str(e)}", status_code=500)
 
-    
+
+# HTTP CostpointToSmartsheet A4 function
+@app.function_name(name="CostpointToSmartsheetA4")
+@app.route(route="CostpointToSmartsheetA4", methods=["POST"])
+def CostpointToSmartsheetA4(req: func.HttpRequest):
+    print("CP → Smartsheet A4")
+    try:
+        run_cp_to_smartsheet(
+            sheet_id=2469989006135172,            # A4 Smartsheet
+            blob_name="Project Data 1CA.xlsx"   # A4 CP source
+        )
+        return func.HttpResponse("A4 Smartsheet sync completed", status_code=200)
+    except Exception as e:
+        return func.HttpResponse(str(e), status_code=500)
+
+
 if __name__ == "__main__":
 
     data_dict = load_data_dictionary()
@@ -827,7 +848,7 @@ if __name__ == "__main__":
     # =====================
     # LOAD CP EXCEL COLUMNS FOR HELP
     # =====================
-    df = read_excel_from_blob(container_name, blob_name)
+    df = read_excel_from_blob(BLOB_CONTAINER, blob_name)
     cp_columns = list(df.columns)
 
     all_fields = sorted(set(list(data_dict.keys()) + cp_columns))
@@ -864,9 +885,17 @@ if __name__ == "__main__":
         print(f"❌ Smartsheet update failed: {e}")
 
     # =====================
-    # RUN SMARTSHEET UPDATE
+    # RUN SMARTSHEET UPDATE A1
     # =====================
     try:
         run_cp_to_smartsheet()
+    except Exception as e:
+        print(f"❌ Smartsheet update failed: {e}")
+
+    # =====================
+    # RUN SMARTSHEET UPDATE A4
+    # =====================
+    try:
+        run_cp_to_smartsheet(sheet_id=2469989006135172, blob_name="Project Data 1CA.xlsx")
     except Exception as e:
         print(f"❌ Smartsheet update failed: {e}")
