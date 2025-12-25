@@ -3,7 +3,6 @@ import pandas as pd
 from datetime import datetime, timedelta
 import json
 import sys
-from datetime import datetime
 import os
 import io
 import argparse
@@ -11,10 +10,31 @@ import azure.functions as func
 import numpy as np
 import smartsheet
 import logging
-
-#----------Azure Blob Connection --------
-
 from azure.storage.blob import BlobServiceClient
+
+# =====================
+# CONFIG
+# =====================
+
+BLOB_CONTAINER = os.environ.get("BLOB_CONTAINER_NAME", "blob1")
+BLOB_NAME = os.environ.get("BLOB_NAME", "Project Data 1.xlsx")
+STORAGE_CONN_STR = os.environ["AzureWebJobsStorage"]
+
+# Azure blob info to variables
+connect_str = STORAGE_CONN_STR
+container_name = BLOB_CONTAINER
+blob_name = BLOB_NAME
+
+BASE_URL = "https://api.projectmanager.com/api/data"
+API_KEY = os.environ.get("API_KEY")
+if not API_KEY:
+    raise RuntimeError("Set API_KEY in environment first!")
+
+headers = {
+    "Authorization": f"Bearer {API_KEY}",
+    "Accept": "application/json",
+    "Content-Type": "application/json"
+}
 
 
 def read_excel_from_blob(container_name, blob_name):
@@ -22,7 +42,6 @@ def read_excel_from_blob(container_name, blob_name):
     Downloads an Excel file from Azure Blob Storage and returns a pandas DataFrame.
     Checks for container and blob existence before reading.
     """
-    connect_str = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
     if not connect_str:
         raise RuntimeError("Set AZURE_STORAGE_CONNECTION_STRING environment variable first!")
 
@@ -64,7 +83,6 @@ class BlobTee:
         self.buffer.flush()
 
     def upload_to_blob(self):
-        connect_str = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
         if not connect_str:
             raise RuntimeError("AZURE_STORAGE_CONNECTION_STRING not set!")
 
@@ -76,21 +94,6 @@ class BlobTee:
         blob_client = container_client.get_blob_client(self.blob_name)
         blob_client.upload_blob(self.buffer.getvalue(), overwrite=True)
         self._stdout.write(f"\n✅ Uploaded log to blob: {self.container_name}/{self.blob_name}\n")
-
-# =====================
-# CONFIG
-# =====================
-API_KEY = os.environ.get("API_KEY")
-if not API_KEY:
-    raise RuntimeError("Set API_KEY_PM in environment first!")
-BASE_URL = "https://api.projectmanager.com/api/data"
-# STORAGE_ACCOUNT_KEY = os.environ.get("AZURE_STORAGE_KEY")
-
-headers = {
-    "Authorization": f"Bearer {API_KEY}",
-    "Accept": "application/json",
-    "Content-Type": "application/json"
-}
 
 # === DATA DICTIONARY ===
 
@@ -224,12 +227,11 @@ def transform_value(rule, value):
 # =====================
 def load_data_dictionary():
     # Azure blob container and blob names
-    container_name = "blob1"
-    blob_name = "CC_PM_Update_DataDict.xlsx"
+    blob_dict_name = "CC_PM_Update_DataDict.xlsx"
 
     try:
         # Attempt to load from Azure blob
-        df = read_excel_from_blob(container_name, blob_name)
+        df = read_excel_from_blob(container_name, blob_dict_name)
 
         # Clean column names
         df.columns = [c.strip() for c in df.columns]
@@ -276,10 +278,9 @@ def load_data_dictionary():
 
 def get_available_filter_fields():
     data_dict = load_data_dictionary()
-    df = read_excel_from_blob("blob1", "Project Data 1.xlsx")
+    df = read_excel_from_blob(container_name, blob_name)
 
     cp_columns = list(df.columns)
-    # all_fields = sorted(set(list(data_dict.keys()) + cp_columns))
 
     return cp_columns
 
@@ -308,9 +309,6 @@ def get_project_status(response_json):
 # READ CP FILE WITH FILTERING
 # =====================
 def readCP_File(data_dict, filters=None, debug=False):
-    # Azure blob info
-    container_name = "blob1"
-    blob_name = "Project Data 1.xlsx"
 
     # Load Excel from blob
     df = read_excel_from_blob(container_name, blob_name)
@@ -566,28 +564,14 @@ def update_pmcom_matching_projects(projects, data_dict, allowed_statuses, debug=
 
 def run_cp_to_pmcom(filters=None, allowed_statuses=None, debug=False):
 
-
-    # # =====================
-    # # LOAD CP EXCEL COLUMNS FOR HELP
-    # # =====================
-    # # excel_file = r"C:\Users\mike.silverglate\OneDrive - Red River Technology LLC\Documents\2025 04 Apr\Project Data 1.xlsx"
-    # df = read_excel_from_blob("blob1", "Project Data 1.xlsx")
-    # print(f"Loaded CP file from blob with {len(df.columns)} columns")
-    # # df = pd.read_excel(excel_file)
-    # cp_columns = list(df.columns)
-
-    # # Merge with data dictionary keys
-    # all_fields = sorted(set(list(data_dict.keys()) + cp_columns))
-    # # all_fields_text = ", ".join(all_fields)
-
     # =====================
     # LOGGING SETUP
     # =====================
-    container = "blob1"
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    blob_name = f"pm_update_log_{timestamp}.txt"
 
-    sys.stdout = BlobTee(container, blob_name)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    blob_name_log = f"pm_update_log_{timestamp}.txt"
+
+    sys.stdout = BlobTee(container_name, blob_name_log)
 
     print("This log will go to both console and blob!")
     print("Processing project data...")
@@ -717,14 +701,18 @@ SHEET_ID = os.environ.get("SMARTSHEET_SHEET_ID")
 print('SHEET_ID', SHEET_ID)
 if not SHEET_ID:
     raise ValueError("SMARTSHEET_SHEET_ID environment variable is missing")
+    # Smartsheet Client 
+
+smartsheet_client = smartsheet.Smartsheet(SMARTSHEET_API_KEY)
+
+# -----------------------------
+# SET UP BLOB CLIENT (like PMCOM)
+# -----------------------------
+        
+blob_service_client = BlobServiceClient.from_connection_string(connect_str)
 
 
-# # Logging
-# logger = logging.getLogger("cp_to_smartsheet")
-# logger.setLevel(logging.INFO)
-
-
-def clear_smartsheet(sheet,smartsheet_client):
+def clear_smartsheet(sheet):
     row_ids = [row.id for row in sheet.rows]
     total_rows = len(row_ids)
     print(f"Starting to clear {total_rows} rows from Smartsheet...")
@@ -752,43 +740,27 @@ def reduce_columns(df, allowed_columns):
 def run_cp_to_smartsheet():
 
     # -----------------------------
-    # SET UP BLOB CLIENT (like PMCOM)
-    # -----------------------------
-            
-    BLOB_CONTAINER = os.environ.get("BLOB_CONTAINER_NAME", "blob1")
-    BLOB_NAME = "Project Data 1.xlsx"
-    blob_name_input = BLOB_NAME
-    STORAGE_CONN_STR = os.environ["AzureWebJobsStorage"]
-
-    blob_service_client = BlobServiceClient.from_connection_string(STORAGE_CONN_STR)
-
-
-    # -----------------------------
     # SET UP BLOB LOGGING (like PMCOM)
     # -----------------------------
 
-    container = BLOB_CONTAINER
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     blob_name_log = f"smartsheet_update_log_{timestamp}.txt"
 
-    tee = BlobTee(container, blob_name_log)
+    tee = BlobTee(container_name, blob_name_log)
     original_stdout = sys.stdout
     sys.stdout = tee
     
-    # Smartsheet Client 
-    smartsheet_client = smartsheet.Smartsheet(SMARTSHEET_API_KEY)
-
     try:
         print("=== Smartsheet Sync Started ===")
         print(f"Start time: {datetime.now()}")
 
-        df = read_excel_from_blob(container, blob_name_input)
+        df = read_excel_from_blob(container_name, blob_name)
         print(f"Loaded CP Excel with {len(df)} rows")
 
         sheet = smartsheet_client.Sheets.get_sheet(SHEET_ID)
         print(f"Loaded Smartsheet '{sheet.name}' with {len(sheet.rows)} existing rows")
 
-        clear_smartsheet(sheet, smartsheet_client)
+        clear_smartsheet(sheet)
 
         smartsheet_columns = [c.title for c in sheet.columns]
         common_columns = list(set(smartsheet_columns).intersection(df.columns))
@@ -855,8 +827,7 @@ if __name__ == "__main__":
     # =====================
     # LOAD CP EXCEL COLUMNS FOR HELP
     # =====================
-    excel_file = r"C:\Users\mike.silverglate\OneDrive - Red River Technology LLC\Documents\2025 04 Apr\Project Data 1.xlsx"
-    df = pd.read_excel(excel_file)
+    df = read_excel_from_blob(container_name, blob_name)
     cp_columns = list(df.columns)
 
     all_fields = sorted(set(list(data_dict.keys()) + cp_columns))
@@ -887,7 +858,10 @@ if __name__ == "__main__":
     # =====================
     # RUN PMCOM UPDATE
     # =====================
-    run_cp_to_pmcom()
+    try:
+        run_cp_to_pmcom()
+    except Exception as e:
+        print(f"❌ Smartsheet update failed: {e}")
 
     # =====================
     # RUN SMARTSHEET UPDATE
