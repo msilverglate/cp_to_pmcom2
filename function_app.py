@@ -569,7 +569,9 @@ def run_cp_to_pmcom(filters=None, allowed_statuses=None, debug=False):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     blob_name_log = f"pm_update_log_{timestamp}.txt"
 
-    sys.stdout = BlobTee(BLOB_CONTAINER, blob_name_log)
+    tee = BlobTee(BLOB_CONTAINER, blob_name_log)
+    original_stdout = sys.stdout
+    sys.stdout = tee
 
     print("This log will go to both console and blob!")
     print("Processing project data...")
@@ -617,7 +619,8 @@ def run_cp_to_pmcom(filters=None, allowed_statuses=None, debug=False):
     print(f"Script run ended at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("===================\n")
 
-    sys.stdout.upload_to_blob()
+    tee.upload_to_blob()
+    sys.stdout = original_stdout
 
 # =====================
 # AZURE FUNCTION APP
@@ -750,7 +753,7 @@ def run_cp_to_smartsheet(
     # -----------------------------
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    blob_name_log = f"smartsheet_update_log_{timestamp}.txt"
+    blob_name_log = f"smartsheet_update_log_{blob_name}_{timestamp}.txt"
 
     tee = BlobTee(BLOB_CONTAINER, blob_name_log)
     original_stdout = sys.stdout
