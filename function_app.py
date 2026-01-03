@@ -27,9 +27,6 @@ BLOB_CONTAINER = os.environ.get("BLOB_BLOB_CONTAINER", "blob1")
 BLOB_NAME_A1 = os.environ.get("BLOB_NAME_A1", "Project Data 1.xlsx")
 STORAGE_CONN_STR = os.environ["AzureWebJobsStorage"]
 
-# Azure blob info to variables
-# blob_name = BLOB_NAME_A1
-
 BASE_URL = "https://api.projectmanager.com/api/data"
 API_KEY = os.environ.get("API_KEY")
 if not API_KEY:
@@ -81,7 +78,7 @@ def setup_blob_logger(blob_container, storage_conn_str, prefix="log"):
     return logger, upload
 
 
-def read_excel_from_blob(BLOB_CONTAINER, blob_name):
+def read_excel_from_blob(BLOB_CONTAINER, blob_name, logger):
     """
     Downloads an Excel file from Azure Blob Storage and returns a pandas DataFrame.
     Checks for container and blob existence before reading.
@@ -102,6 +99,7 @@ def read_excel_from_blob(BLOB_CONTAINER, blob_name):
     # Download blob into memory and read with pandas
     blob_data = blob_client.download_blob().readall()
     df = pd.read_excel(io.BytesIO(blob_data))
+    logger.info(f"✅ Loaded {len(df)} rows from blob {blob_name} in container {BLOB_CONTAINER}")
     return df
 
 
@@ -241,8 +239,7 @@ def load_data_dictionary(logger):
 
     try:
         # Attempt to load from Azure blob
-        df = read_excel_from_blob(BLOB_CONTAINER, blob_dict_name)
-        logger.info(f"✅ Loaded {len(df)} rows from blob {blob_dict_name} in container {BLOB_CONTAINER}")
+        df = read_excel_from_blob(BLOB_CONTAINER, blob_dict_name, logger)
 
         # Clean column names
         df.columns = [c.strip() for c in df.columns]
@@ -287,13 +284,6 @@ def load_data_dictionary(logger):
             return {}
 
 
-def get_available_filter_fields():
-    df = read_excel_from_blob(BLOB_CONTAINER, BLOB_NAME_A1)
-    cp_columns = list(df.columns)
-
-    return cp_columns
-
-
 def get_project_status(response_json):
     """
     Extracts the project status name ("Open", "Closed", etc.)
@@ -319,9 +309,8 @@ def get_project_status(response_json):
 # READ CP FILE WITH FILTERING
 # =====================
 def filterCPProjectsToUpdate(data_dict, filters=None, debug=False, logger=None):
-    # Load Excel from blob
-    df = read_excel_from_blob(BLOB_CONTAINER, BLOB_NAME_A1)
-    logger.info(f"✅ Loaded {len(df)} rows from blob {BLOB_NAME_A1} in container {BLOB_CONTAINER}")
+    # Load Excel from blob and filter down CP dataset
+    df = read_excel_from_blob(BLOB_CONTAINER, BLOB_NAME_A1, logger)
 
     df["PJ UDEF Date 1"] = pd.to_datetime(df["PJ UDEF Date 1"], errors="coerce")
     threshold_date = datetime.now() - timedelta(days=30)
@@ -338,27 +327,71 @@ def filterCPProjectsToUpdate(data_dict, filters=None, debug=False, logger=None):
         )
         ]
 
-    # Command-line filters
+    # ----------------------------------------
+    # Apply command-line filters
+    # ----------------------------------------
     if filters:
-        for f in filters:
-            field, pattern = f.split("=", 1)
-            field = field.strip()
-            pattern = pattern.strip().replace("%", ".*")  # wildcard -> regex
-            if field not in filtered_df.columns:
-                logger.info(f"[FILTER WARNING] Column '{field}' not in dataframe, skipping")
+        for filter_expr in filters:
+            # Parse filter expression: column=pattern
+            column_name, raw_pattern = filter_expr.split("=", 1)
+            column_name = column_name.strip()
+            raw_pattern = raw_pattern.strip()
+
+            # Convert SQL-style wildcard (%) to regex (.*)
+            regex_pattern = raw_pattern.replace("%", ".*")
+
+            # Skip invalid columns
+            if column_name not in filtered_df.columns:
+                logger.info(
+                    "[FILTER WARNING] Column '%s' not in dataframe, skipping",
+                    column_name
+                )
                 continue
-            regex = re.compile(pattern, re.IGNORECASE)
-            filtered_df = filtered_df[filtered_df[field].astype(str).apply(lambda x: bool(regex.search(x)))]
+
+            # Compile regex (case-insensitive)
+            compiled_regex = re.compile(regex_pattern, re.IGNORECASE)
+
+            # Apply filter row-by-row
+            def matches_filter(cell_value):
+                return bool(compiled_regex.search(str(cell_value)))
+
+            filtered_df = filtered_df[
+                filtered_df[column_name].apply(matches_filter)
+            ]
+
             if debug:
                 logger.info(
-                    f"[FILTER DEBUG] Applied filter: {field} LIKE {pattern}, remaining rows: {len(filtered_df)}")
+                    "[FILTER DEBUG] Applied filter: %s LIKE %s, remaining rows: %d",
+                    column_name,
+                    regex_pattern,
+                    len(filtered_df)
+                )
 
+    # ----------------------------------------
+    # Build project update payloads
+    # ----------------------------------------
     projects_to_update = []
+
     for _, row in filtered_df.iterrows():
-        project_data = {"shortCode": str(row["Opportunity ID"])[-7:], "source_row": row}
-        for key, meta in data_dict.items():
-            raw_val = row.get(meta["cp_source"])
-            project_data[key] = transform_value(meta["transform"], raw_val)
+        project_data = {}
+
+        # Derive shortCode from Opportunity ID
+        opportunity_id = str(row.get("Opportunity ID", ""))
+        project_data["shortCode"] = opportunity_id[-7:]
+
+        # Preserve original row for traceability
+        project_data["source_row"] = row
+
+        # Map and transform fields using data dictionary
+        for output_field, metadata in data_dict.items():
+            source_column = metadata["cp_source"]
+            transform_name = metadata["transform"]
+
+            raw_value = row.get(source_column)
+            transformed_value = transform_value(transform_name, raw_value)
+
+            project_data[output_field] = transformed_value
+
         projects_to_update.append(project_data)
 
     logger.info("Filtered rows: %d", len(projects_to_update))
@@ -629,12 +662,13 @@ def CostpointToPMcom(req: func.HttpRequest):
     # GET → describe function
     # -------------------------
     if req.method == "GET":
-        fields = get_available_filter_fields()
+        df = read_excel_from_blob(BLOB_CONTAINER, BLOB_NAME_A1, logger = bootstrap_logger)
+        cp_columns = list(df.columns)
 
         return func.HttpResponse(
             json.dumps({
                 "description": "Update PM.com projects from CP Excel feed",
-                "available_filters": fields,
+                "available_filters": cp_columns,
                 "filter_syntax": "FieldName=Value or FieldName=%partial%",
                 "examples": {
                     "filters": [
@@ -722,8 +756,7 @@ def run_cp_to_smartsheet(sheet_id: int, blob_name: str, debug=False):
         logger.info(f"=== CP → Smartsheet Sync Started ({blob_name}) ===")
         logger.info(f"Start time: {datetime.now()}")
 
-        df = read_excel_from_blob(BLOB_CONTAINER, blob_name)
-        logger.info(f"✅ Loaded {len(df)} rows from blob {blob_name} in container {BLOB_CONTAINER}")
+        df = read_excel_from_blob(BLOB_CONTAINER, blob_name, logger)
 
         sheet = smartsheet_client.Sheets.get_sheet(sheet_id)
         logger.info(f"Loaded Smartsheet '{sheet.name}' with {len(sheet.rows)} existing rows")
@@ -802,7 +835,7 @@ if __name__ == "__main__":
     # =====================
     # LOAD CP EXCEL COLUMNS FOR HELP
     # =====================
-    df = read_excel_from_blob(BLOB_CONTAINER, BLOB_NAME_A1)
+    df = read_excel_from_blob(BLOB_CONTAINER, BLOB_NAME_A1, logger=bootstrap_logger)
     bootstrap_logger.info(f"✅ Loaded {len(df)} rows from blob {BLOB_NAME_A1} in container {BLOB_CONTAINER}")
 
     cp_columns = list(df.columns)
