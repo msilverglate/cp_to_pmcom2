@@ -1,16 +1,19 @@
+## Version 2.1
+
 import requests
 import re
 import pandas as pd
 from datetime import datetime, timedelta
 import json
 import os
-import io
 import argparse
 import azure.functions as func
-import numpy as np
 import smartsheet
 import logging
-from azure.storage.blob import BlobServiceClient
+import uuid
+from logging_utils import setup_blob_logger
+from excel_utils import read_excel_from_blob
+from smartsheet_utils import clear_smartsheet, reduce_columns
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,6 +28,7 @@ bootstrap_logger = logging.getLogger("bootstrap")
 
 BLOB_CONTAINER = os.environ.get("BLOB_BLOB_CONTAINER", "blob1")
 BLOB_NAME_A1 = os.environ.get("BLOB_NAME_A1", "Project Data 1.xlsx")
+BLOB_NAME_A3 = os.environ.get("BLOB_NAME_A3", "Project Data 1CA.xlsx")
 STORAGE_CONN_STR = os.environ["AzureWebJobsStorage"]
 
 BASE_URL = "https://api.projectmanager.com/api/data"
@@ -37,70 +41,6 @@ headers = {
     "Accept": "application/json",
     "Content-Type": "application/json"
 }
-
-
-def setup_blob_logger(blob_container, storage_conn_str, prefix="log"):
-    """
-    Returns a logger and an upload function.
-    Logs go to console AND in-memory buffer, then uploaded to Azure blob at the end.
-    """
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    blob_name = f"{prefix}_{timestamp}.txt"
-    buffer = io.StringIO()
-
-    # Use a unique logger name per run
-    logger = logging.getLogger(f"{prefix}_{timestamp}")
-    logger.setLevel(logging.INFO)
-
-    # Clear previous handlers (important!)
-    if logger.hasHandlers():
-        logger.handlers.clear()
-
-    # 1️⃣ Console handler
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.INFO)
-    ch.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-    logger.addHandler(ch)
-
-    # 2️⃣ Buffer handler (writes to StringIO for blob upload)
-    bh = logging.StreamHandler(buffer)
-    bh.setLevel(logging.INFO)
-    bh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-    logger.addHandler(bh)
-
-    # Upload function
-    def upload():
-        blob_service_client = BlobServiceClient.from_connection_string(storage_conn_str)
-        blob_client = blob_service_client.get_blob_client(blob_container, blob_name)
-        blob_client.upload_blob(buffer.getvalue(), overwrite=True)
-        logger.info(f"✅ Uploaded log to blob: {blob_container}/{blob_name}")
-
-    return logger, upload
-
-
-def read_excel_from_blob(BLOB_CONTAINER, blob_name, logger):
-    """
-    Downloads an Excel file from Azure Blob Storage and returns a pandas DataFrame.
-    Checks for container and blob existence before reading.
-    """
-    if not STORAGE_CONN_STR:
-        raise RuntimeError("Set AZURE_STORAGE_CONNECTION_STRING environment variable first!")
-
-    blob_service_client = BlobServiceClient.from_connection_string(STORAGE_CONN_STR)
-    container_client = blob_service_client.get_container_client(BLOB_CONTAINER)
-
-    if not container_client.exists():
-        raise RuntimeError(f"Container '{BLOB_CONTAINER}' does not exist!")
-
-    blob_client = container_client.get_blob_client(blob_name)
-    if not blob_client.exists():
-        raise RuntimeError(f"Blob '{blob_name}' does not exist in container '{BLOB_CONTAINER}'!")
-
-    # Download blob into memory and read with pandas
-    blob_data = blob_client.download_blob().readall()
-    df = pd.read_excel(io.BytesIO(blob_data))
-    logger.info(f"✅ Loaded {len(df)} rows from blob {blob_name} in container {BLOB_CONTAINER}")
-    return df
 
 
 # === DATA DICTIONARY ===
@@ -239,7 +179,7 @@ def load_data_dictionary(logger):
 
     try:
         # Attempt to load from Azure blob
-        df = read_excel_from_blob(BLOB_CONTAINER, blob_dict_name, logger)
+        df = read_excel_from_blob(blob_dict_name,logger)
 
         # Clean column names
         df.columns = [c.strip() for c in df.columns]
@@ -310,7 +250,7 @@ def get_project_status(response_json):
 # =====================
 def filterCPProjectsToUpdate(data_dict, filters=None, debug=False, logger=None):
     # Load Excel from blob and filter down CP dataset
-    df = read_excel_from_blob(BLOB_CONTAINER, BLOB_NAME_A1, logger)
+    df = read_excel_from_blob(BLOB_NAME_A1, logger)
 
     df["PJ UDEF Date 1"] = pd.to_datetime(df["PJ UDEF Date 1"], errors="coerce")
     threshold_date = datetime.now() - timedelta(days=30)
@@ -613,7 +553,11 @@ def update_pmcom_matching_projects(projects, data_dict, not_allowed_statuses, de
 
 
 def run_cp_to_pmcom(filters=None, not_allowed_statuses=None, debug=False):
-    logger, upload_log = setup_blob_logger(BLOB_CONTAINER, STORAGE_CONN_STR, prefix="pm_update_log")
+    logger, upload_log = setup_blob_logger(prefix="pm_update_log")
+
+    invocation_id = str(uuid.uuid4())
+    instance = os.environ.get("WEBSITE_INSTANCE_ID", "local")
+    logger.info(f"PMCOM START | instance={instance} | invocation={invocation_id}")
 
     try:
         logger.info("=== CP → PMCOM Update Started ===")
@@ -661,8 +605,9 @@ def CostpointToPMcom(req: func.HttpRequest):
     # -------------------------
     # GET → describe function
     # -------------------------
+
     if req.method == "GET":
-        df = read_excel_from_blob(BLOB_CONTAINER, BLOB_NAME_A1, logger = bootstrap_logger)
+        df = read_excel_from_blob(BLOB_NAME_A1, logger=bootstrap_logger)
         cp_columns = list(df.columns)
 
         return func.HttpResponse(
@@ -713,35 +658,12 @@ def CostpointToPMcom(req: func.HttpRequest):
 # SMARTSHEET IMPORT
 # =====================
 
-def clear_smartsheet(sheet, smartsheet_client, logger):
-    row_ids = [row.id for row in sheet.rows]
-    total_rows = len(row_ids)
-    logger.info(f"Starting to clear {total_rows} rows from Smartsheet...")
-
-    CHUNK_SIZE = 400
-    deleted_count = 0
-
-    for i in range(0, total_rows, CHUNK_SIZE):
-        chunk = row_ids[i:i + CHUNK_SIZE]
-        smartsheet_client.Sheets.delete_rows(sheet.id, chunk)
-        deleted_count += len(chunk)
-        logger.info(f"Deleted {len(chunk)} rows in this chunk. Total deleted so far: {deleted_count}/{total_rows}")
-
-    logger.info(f"Completed clearing rows. Total deleted: {deleted_count}")
-
-
-def reduce_columns(df, allowed_columns):
-    df1 = df[sorted(allowed_columns)].copy()
-    for col in ["PJ UDEF Date 1", "End Date", "Project Start Date"]:
-        if col in df1.columns:
-            df1[col] = df1[col].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    df1.replace({np.nan: ""}, inplace=True)
-    return df1
-
-
 def run_cp_to_smartsheet(sheet_id: int, blob_name: str, debug=False):
-    logger, upload_log = setup_blob_logger(BLOB_CONTAINER, STORAGE_CONN_STR,
-                                           prefix=f"smartsheet_update_log_{blob_name}")
+    logger, upload_log = setup_blob_logger(prefix=f"smartsheet_update_log_{blob_name}")
+
+    invocation_id = str(uuid.uuid4())
+    instance = os.environ.get("WEBSITE_INSTANCE_ID", "local")
+    logger.info(f"PMCOM START | instance={instance} | invocation={invocation_id}")
 
     logger.info("CP → Smartsheet function triggered")
     try:
@@ -756,7 +678,7 @@ def run_cp_to_smartsheet(sheet_id: int, blob_name: str, debug=False):
         logger.info(f"=== CP → Smartsheet Sync Started ({blob_name}) ===")
         logger.info(f"Start time: {datetime.now()}")
 
-        df = read_excel_from_blob(BLOB_CONTAINER, blob_name, logger)
+        df = read_excel_from_blob(blob_name, logger)
 
         sheet = smartsheet_client.Sheets.get_sheet(sheet_id)
         logger.info(f"Loaded Smartsheet '{sheet.name}' with {len(sheet.rows)} existing rows")
@@ -798,16 +720,23 @@ def run_cp_to_smartsheet(sheet_id: int, blob_name: str, debug=False):
         logger.info(f"End time: {datetime.now()}")
         upload_log()
 
-
 # HTTP trigger CostpointToSmartsheet A1 function
-@app.function_name(name="CostpointToSmartsheet")
-@app.route(route="CostpointToSmartsheet", methods=["POST"])
+@ app.function_name(name="CostpointToSmartsheet")
+@ app.route(route="CostpointToSmartsheet", methods=["POST"])
 def CostpointToSmartsheet(req: func.HttpRequest):
+    # Optional: log receipt
+    bootstrap_logger.info("HTTP request received — returning 200 immediately")
+
+    # 🔑 Return HTTP 200 fast
+    # return func.HttpResponse(
+    #     "Accepted",
+    #     status_code=200
+    # )
 
     try:
         run_cp_to_smartsheet(
             sheet_id=864938054602628,  # A1 Smartsheet
-            blob_name="Project Data 1.xlsx"  # A1 CP source
+            blob_name=BLOB_NAME_A1  # A1 CP source
         )
         return func.HttpResponse("Costpoint to Smartsheet completed successfully", status_code=200)
     except Exception as e:
@@ -819,11 +748,10 @@ def CostpointToSmartsheet(req: func.HttpRequest):
 @app.function_name(name="CostpointToSmartsheetA4")
 @app.route(route="CostpointToSmartsheetA4", methods=["POST"])
 def CostpointToSmartsheetA4(req: func.HttpRequest):
-
     try:
         run_cp_to_smartsheet(
             sheet_id=2469989006135172,  # A4 Smartsheet
-            blob_name="Project Data 1CA.xlsx"  # A4 CP source
+            blob_name=BLOB_NAME_A3  # A4 CP source
         )
         return func.HttpResponse("A4 Smartsheet sync completed", status_code=200)
     except Exception as e:
@@ -835,7 +763,7 @@ if __name__ == "__main__":
     # =====================
     # LOAD CP EXCEL COLUMNS FOR HELP
     # =====================
-    df = read_excel_from_blob(BLOB_CONTAINER, BLOB_NAME_A1, logger=bootstrap_logger)
+    df = read_excel_from_blob(BLOB_NAME_A1, logger=bootstrap_logger)
     bootstrap_logger.info(f"✅ Loaded {len(df)} rows from blob {BLOB_NAME_A1} in container {BLOB_CONTAINER}")
 
     cp_columns = list(df.columns)
@@ -868,7 +796,7 @@ if __name__ == "__main__":
     # RUN SMARTSHEET UPDATE A1
     # =====================
     try:
-        run_cp_to_smartsheet(sheet_id=864938054602628, blob_name="Project Data 1.xlsx")  # A1 data
+        run_cp_to_smartsheet(sheet_id=864938054602628, blob_name=BLOB_NAME_A1)  # A1 data
     except Exception as e:
         bootstrap_logger.error(f"❌ Smartsheet update failed: {e}")
 
@@ -876,6 +804,6 @@ if __name__ == "__main__":
     # RUN SMARTSHEET UPDATE A4
     # =====================
     try:
-        run_cp_to_smartsheet(sheet_id=2469989006135172, blob_name="Project Data 1CA.xlsx")  # A3 data
+        run_cp_to_smartsheet(sheet_id=2469989006135172, blob_name=BLOB_NAME_A3)  # A3 data
     except Exception as e:
         bootstrap_logger.error(f"❌ Smartsheet update failed: {e}")
