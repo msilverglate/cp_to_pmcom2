@@ -2,6 +2,7 @@
 # SMARTSHEET UTILS
 # =====================
 import numpy as np
+import time
 
 def clear_smartsheet(sheet, smartsheet_client, logger):
     row_ids = [row.id for row in sheet.rows]
@@ -16,6 +17,10 @@ def clear_smartsheet(sheet, smartsheet_client, logger):
         smartsheet_client.Sheets.delete_rows(sheet.id, chunk)
         deleted_count += len(chunk)
         logger.info(f"Deleted {len(chunk)} rows in this chunk. Total deleted so far: {deleted_count}/{total_rows}")
+
+        # Add a short delay for testing
+        # logger.info("Pausing briefly to observe deletion...")
+        # time.sleep(10)  # <-- adjust seconds as needed
 
     logger.info(f"Completed clearing rows. Total deleted: {deleted_count}")
 

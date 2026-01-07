@@ -1,4 +1,4 @@
-## Version 2.2
+## Version 2.1
 
 import requests
 import re
@@ -11,12 +11,9 @@ import azure.functions as func
 import smartsheet
 import logging
 import uuid
-import base64
 from logging_utils import setup_blob_logger
 from excel_utils import read_excel_from_blob
 from smartsheet_utils import clear_smartsheet, reduce_columns
-from azure.storage.queue import QueueClient
-
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,7 +28,7 @@ bootstrap_logger = logging.getLogger("bootstrap")
 
 BLOB_CONTAINER = os.environ.get("BLOB_BLOB_CONTAINER", "blob1")
 BLOB_NAME_A1 = os.environ.get("BLOB_NAME_A1", "Project Data 1.xlsx")
-BLOB_NAME_A4 = os.environ.get("BLOB_NAME_A4", "Project Data 1CA.xlsx")
+BLOB_NAME_A3 = os.environ.get("BLOB_NAME_A3", "Project Data 1CA.xlsx")
 STORAGE_CONN_STR = os.environ["AzureWebJobsStorage"]
 
 BASE_URL = "https://api.projectmanager.com/api/data"
@@ -723,76 +720,27 @@ def run_cp_to_smartsheet(sheet_id: int, blob_name: str, debug=False):
         logger.info(f"End time: {datetime.now()}")
         upload_log()
 
-#  from function_app import run_cp_to_smartsheet  # adjust import as needed
-
-# ---------------------------
-# Queue-triggered function
-# ---------------------------
-@app.function_name(name="CostpointToSmartsheetQueue")
-@app.queue_trigger(
-    arg_name="msg",
-    queue_name="cp-smartsheet-queue",
-    connection="AzureWebJobsStorage"
-)
-def CostpointToSmartsheetQueue(msg: func.QueueMessage):
-    """
-    Queue-triggered function to run the CP → Smartsheet update asynchronously.
-    Expects messages JSON with 'sheet_id' and 'blob_name'.
-    """
-    try:
-        # runtime handles Base64, just decode bytes to string
-        payload = json.loads(msg.get_body().decode("utf-8"))
-        sheet_id = payload.get("sheet_id")
-        blob_name = payload.get("blob_name")
-
-        bootstrap_logger.info(f"Queue message received: sheet_id={sheet_id}, blob_name={blob_name}")
-
-        # Call main function
-        run_cp_to_smartsheet(sheet_id=sheet_id, blob_name=blob_name)
-
-    except Exception as e:
-        bootstrap_logger.exception(f"Error processing queue message: {e}")
-        raise  # ensures message goes to poison queue if it fails
-
-# ---------------------------
-# HTTP-triggered function to enqueue messages
-# ---------------------------
-QUEUE_NAME = "cp-smartsheet-queue"
-
-@app.function_name(name="CostpointToSmartsheet")
-@app.route(route="CostpointToSmartsheet", methods=["POST"])
+# HTTP trigger CostpointToSmartsheet A1 function
+@ app.function_name(name="CostpointToSmartsheet")
+@ app.route(route="CostpointToSmartsheet", methods=["POST"])
 def CostpointToSmartsheet(req: func.HttpRequest):
-    """
-    HTTP POST endpoint to enqueue a Smartsheet job.
-    """
+    # Optional: log receipt
+    bootstrap_logger.info("HTTP request received — returning 200 immediately")
+
+    # 🔑 Return HTTP 200 fast
+    # return func.HttpResponse(
+    #     "Accepted",
+    #     status_code=200
+    # )
+
     try:
-        # Message payload
-        payload = {
-            "sheet_id": 864938054602628,
-            "blob_name": "Project Data 1.xlsx"
-        }
-
-        # Convert to JSON, then Base64
-        json_str = json.dumps(payload)
-        encoded_message = base64.b64encode(json_str.encode("utf-8")).decode("utf-8")
-
-        # CREATE QUEUE BEFORE USING
-        # az storage queue create \
-        #   --name cp-smartsheet-queue \
-        #   --account-name costpoint1 \
-        #   --account-key <STORAGE_ACCOUNT_KEY>
-
-        # Send to queue
-        queue_client = QueueClient.from_connection_string(STORAGE_CONN_STR, QUEUE_NAME)
-        queue_client.send_message(encoded_message)
-
-        bootstrap_logger.info("Base64-encoded message sent successfully!")
-        bootstrap_logger.info(f"Message sent successfully to queue {QUEUE_NAME}: {payload}")
-
-        return func.HttpResponse("Smartsheet job queued", status_code=202)
-
+        run_cp_to_smartsheet(
+            sheet_id=864938054602628,  # A1 Smartsheet
+            blob_name=BLOB_NAME_A1  # A1 CP source
+        )
+        return func.HttpResponse("Costpoint to Smartsheet completed successfully", status_code=200)
     except Exception as e:
-        bootstrap_logger.exception("❌ Failed to enqueue Smartsheet job")
+        bootstrap_logger.error("Unhandled exception")
         return func.HttpResponse(f"Error: {str(e)}", status_code=500)
 
 
@@ -803,7 +751,7 @@ def CostpointToSmartsheetA4(req: func.HttpRequest):
     try:
         run_cp_to_smartsheet(
             sheet_id=2469989006135172,  # A4 Smartsheet
-            blob_name=BLOB_NAME_A4  # A4 CP source
+            blob_name=BLOB_NAME_A3  # A4 CP source
         )
         return func.HttpResponse("A4 Smartsheet sync completed", status_code=200)
     except Exception as e:
@@ -856,6 +804,6 @@ if __name__ == "__main__":
     # RUN SMARTSHEET UPDATE A4
     # =====================
     try:
-        run_cp_to_smartsheet(sheet_id=2469989006135172, blob_name=BLOB_NAME_A4)  # A3 data
+        run_cp_to_smartsheet(sheet_id=2469989006135172, blob_name=BLOB_NAME_A3)  # A3 data
     except Exception as e:
         bootstrap_logger.error(f"❌ Smartsheet update failed: {e}")
