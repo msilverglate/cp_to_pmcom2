@@ -1,4 +1,4 @@
-## Version 2.2
+## Version 2.3 Level 6 Hours Entered and Local run w/local variables
 
 import requests
 import re
@@ -6,7 +6,6 @@ import pandas as pd
 from datetime import datetime, timedelta
 import json
 import os
-import argparse
 import azure.functions as func
 import smartsheet
 import logging
@@ -29,13 +28,13 @@ bootstrap_logger = logging.getLogger("bootstrap")
 # CONFIG
 # =====================
 
-BLOB_CONTAINER = os.environ.get("BLOB_BLOB_CONTAINER", "blob1")
-BLOB_NAME_A1 = os.environ.get("BLOB_NAME_A1", "Project Data 1.xlsx")
+BLOB_CONTAINER = os.environ.get("BLOB_CONTAINER_NAME", "blob1")
+BLOB_NAME_A1 = os.environ.get("BLOB_NAME_A1", "Project Data 2.xlsx")
 BLOB_NAME_A4 = os.environ.get("BLOB_NAME_A4", "Project Data 1CA.xlsx")
 STORAGE_CONN_STR = os.environ["AzureWebJobsStorage"]
 
 BASE_URL = "https://api.projectmanager.com/api/data"
-API_KEY = os.environ.get("API_KEY")
+API_KEY = os.environ.get("PM_API_KEY")
 if not API_KEY:
     raise RuntimeError("Set API_KEY in environment first!")
 
@@ -92,6 +91,34 @@ DEFAULT_DATA_DICTIONARY = '''
     "pm_field": "Case Code",
     "update": "ifBlank",
     "transform": "regex_left_of_last_dot"
+  },
+    "cpEngActHrsProj": {
+    "cp_source": "CP ENG ACT HRS",
+    "field_type": "ProjCustom",
+    "pm_field": "CP ENG ACT HRS",
+    "update": "Always",
+    "transform": null
+  },
+    "cpPm1ActHrsProj": {
+    "cp_source": "CP PM1 ACT HRS",
+    "field_type": "ProjCustom",
+    "pm_field": "CP PM1 ACT HRS",
+    "update": "Always",
+    "transform": null
+  },
+    "cpTrvActHrsProj": {
+    "cp_source": "CP TRV ACT HRS",
+    "field_type": "ProjCustom",
+    "pm_field": "CP TRV ACT HRS",
+    "update": "Always",
+    "transform": null
+  },
+    "cpDnbActHrsProj": {
+    "cp_source": "CP DNB ACT HRS",
+    "field_type": "ProjCustom",
+    "pm_field": "CP DNB ACT HRS",
+    "update": "Always",
+    "transform": null
   }
 }
 
@@ -249,11 +276,144 @@ def get_project_status(response_json):
 
 
 # =====================
+# APPLY LEVEL 6 HOURS ENG PM TRV DNB AT PROJECT LEVEL
+# =====================
+
+
+def apply_level6_hours_to_pm_fields(df, logger, debug=False):
+    """
+    Updates a DataFrame by placing Level 6 'Entered Hours' into PM-specific columns,
+    then rolls up sums into the Level 5 parent project rows.
+
+    pm_fields: dict mapping Level 6 suffix to DataFrame column name
+        e.g., {"ENG": "CP ENG ACT HRS", "PM1": "CP PM1 ACT HRS", ...}
+    """
+    pm_fields = {
+        "ENG": "CP ENG ACT HRS",
+        "PM1": "CP PM1 ACT HRS",
+        "DNB": "CP DNB ACT HRS",
+        "TRV": "CP TRV ACT HRS",
+        "ODC": "CP ODC ACT HRS",
+        "SUB": "CP SUB ACT HRS"
+    }
+
+    # 1️⃣ Assign Level 6 Entered Hours to PM columns
+    level6_pattern = re.compile(r"^(?:[^.]+\.){5}([A-Z0-9]+)$")  # last group after 5 dots
+
+    for idx, row in df.iterrows():
+        match = level6_pattern.match(row["Project ID"])
+        if not match:
+            continue  # skip non-Level6
+
+        suffix = match.group(1)
+        if suffix in pm_fields:
+            df.at[idx, pm_fields[suffix]] = row.get("Entered Hours", 0.0)
+            if debug:
+                logger.info(
+                    f"[DEBUG] Level 6 {row['Project ID']} -> {pm_fields[suffix]} = {df.at[idx, pm_fields[suffix]]}")
+
+    # 2️⃣ Roll up Level 6 hours into Level 5 projects
+    level5_df = df[df["Level Number"] == 5].copy()
+    for idx, row in level5_df.iterrows():
+        pid = row["Project ID"]
+        # Find all Level 6 children of this Level 5 project
+        children = df[df["Project ID"].str.startswith(pid + ".")]
+        for suffix, col_name in pm_fields.items():
+            total = children[col_name].sum() if not children.empty else 0.0
+            df.at[idx, col_name] = total
+            if debug:
+                logger.info(f"[DEBUG] Level 5 {pid} roll-up -> {col_name} = {total}")
+
+    return df
+
+
+def apply_level6_hours_to_pm_fields_old(df, logger=None, debug=False):
+    """
+    Extract Level 6 suffix from Project ID and copy Entered Hours
+    into exactly one PM.com project field per row.
+
+    Supported suffixes:
+      ENG → CP ENG ACT HRS
+      PM1 → CP PM1 ACT HRS
+      DNB → CP DNB ACT HRS
+      TRV → CP TRV ACT HRS
+
+    Only rows with a Level 6 suffix are processed.
+    NaN values are converted to 0.0.
+    """
+
+    # Normalize Project ID
+    df["Project ID"] = df["Project ID"].astype(str).str.strip()
+
+    # Ensure Entered Hours exists
+    if "Entered Hours" not in df.columns:
+        df["Entered Hours"] = 0.0
+    df["Entered Hours"] = df["Entered Hours"].fillna(0.0)
+
+    # Initialize PM.com fields
+    pm_fields = {
+        "ENG": "CP ENG ACT HRS",
+        "PM1": "CP PM1 ACT HRS",
+        "DNB": "CP DNB ACT HRS",
+        "TRV": "CP TRV ACT HRS"
+    }
+    for col in pm_fields.values():
+        df[col] = 0.0  # initialize to zero
+
+    # Apply hours only for Level 6 suffixes (last group after .)
+    level6_suffix_pattern = re.compile(r"^(?:[^.]+\.){5}([A-Z0-9]+)$")
+
+    for idx, row in df.iterrows():
+        match = level6_suffix_pattern.match(row["Project ID"])
+        if not match:
+            continue  # skip if not Level 6
+
+        suffix = match.group(1)
+        if suffix in pm_fields:
+            df.at[idx, pm_fields[suffix]] = row["Entered Hours"]
+
+    # Log unknown suffixes
+    if logger:
+        known_suffixes = set(pm_fields.keys())
+        level6_suffixes = df["Project ID"].map(lambda pid: level6_suffix_pattern.match(pid).group(1) if level6_suffix_pattern.match(pid) else None)
+        unknown_suffixes = set(filter(None, level6_suffixes)) - known_suffixes
+        if unknown_suffixes:
+            logger.warning(f"Unknown Level 6 suffixes found: {unknown_suffixes}")
+
+        # ----------------------------
+        # Debug output (non-zero examples)
+        # ----------------------------
+    if debug:
+        pm_columns = list(pm_fields.values())
+
+        # Build a mask dynamically
+        mask = df[pm_columns].ne(0).any(axis=1)  # True for rows where any PM field != 0
+
+        # Select debug columns
+        debug_cols = ["Project ID", "Entered Hours"] + pm_columns
+
+        non_zero_df = df.loc[mask, debug_cols].head(1000)
+
+        if logger:
+            logger.info("Sample rows with non-zero Level 6 PM.com hours:")
+            logger.info(
+                "\n" + non_zero_df.to_string(index=False)
+            )
+        else:
+            print("\nSample rows with non-zero Level 6 PM.com hours:")
+            print(non_zero_df.to_string(index=False))
+
+    return df
+
+# =====================
 # READ CP FILE WITH FILTERING
 # =====================
 def filterCPProjectsToUpdate(data_dict, filters=None, debug=False, logger=None):
     # Load Excel from blob and filter down CP dataset
     df = read_excel_from_blob(BLOB_NAME_A1, logger)
+
+    # Call function to add Level 6 Entered Hours to Level 5 columns in df
+    df = apply_level6_hours_to_pm_fields(df, logger, debug)
 
     df["PJ UDEF Date 1"] = pd.to_datetime(df["PJ UDEF Date 1"], errors="coerce")
     threshold_date = datetime.now() - timedelta(days=30)
@@ -477,7 +637,7 @@ def update_pmcom_matching_projects(projects, data_dict, not_allowed_statuses, de
         # 4. PROCESS ALL CP→PM FIELDS
         # ───────────────────────────────────────────────
         for key, meta in data_dict.items():
-            value = proj[key]
+            value = str(proj[key]) if proj[key] is not None else None
             field_type = meta["field_type"]
             pm_field = meta["pm_field"].lower()
             rule = meta["update"]
@@ -521,6 +681,7 @@ def update_pmcom_matching_projects(projects, data_dict, not_allowed_statuses, de
 
                 if debug:
                     logger.info(f"[DEBUG] PUT {put_url} -> {r.status_code}")
+                    logger.info(f"[DEBUG] PUT payload for {pm_field}: {str(value)}")
 
             # TASK CUSTOM FIELD (FAST MODE, NO PER-TASK GET)
             elif field_type == "TaskCustom":
@@ -561,6 +722,15 @@ def run_cp_to_pmcom(filters=None, not_allowed_statuses=None, debug=False):
     invocation_id = str(uuid.uuid4())
     instance = os.environ.get("WEBSITE_INSTANCE_ID", "local")
     logger.info(f"PMCOM START | instance={instance} | invocation={invocation_id}")
+
+    # ----------------------------
+    # Debug: list all PMCOM fields
+    # ----------------------------
+    if debug and logger:
+        field_ids = load_project_field_ids()
+        logger.info("PMCOM project fields currently available:")
+        for name, fid in field_ids.items():
+            logger.info(f"  {name} → {fid}")
 
     try:
         logger.info("=== CP → PMCOM Update Started ===")
@@ -689,6 +859,7 @@ def run_cp_to_smartsheet(sheet_id: int, blob_name: str, debug=False):
         clear_smartsheet(sheet, smartsheet_client, logger)
 
         smartsheet_columns = [c.title for c in sheet.columns]
+        logger.info(f"SmartSheet columns {smartsheet_columns}")
         common_columns = list(set(smartsheet_columns).intersection(df.columns))
         df1 = reduce_columns(df, common_columns)
         logger.info(f"Matched columns ({len(common_columns)}): {common_columns}")
@@ -766,10 +937,10 @@ def CostpointToSmartsheet(req: func.HttpRequest):
     HTTP POST endpoint to enqueue a Smartsheet job.
     """
     try:
-        # Message payload
+        # Message payload TODO: Send blob_name from trigger for dynamic update
         payload = {
             "sheet_id": 864938054602628,
-            "blob_name": "Project Data 1.xlsx"
+            "blob_name": BLOB_NAME_A1
         }
 
         # Convert to JSON, then Base64
@@ -813,49 +984,59 @@ def CostpointToSmartsheetA4(req: func.HttpRequest):
 if __name__ == "__main__":
 
     # =====================
-    # LOAD CP EXCEL COLUMNS FOR HELP
+    # LOCAL CONFIG (edit here)
+    # =====================
+    DEBUG = False
+
+    FILTERS = ["Project Manager Name=%Silverglate%"]     # e.g. ["PROJ_MGR_NAME=Russell"]
+    NOT_ALLOWED_STATUSES = ["CLOSED"]        # e.g. ["CLOSED", "ON_HOLD"]
+
+    # =====================
+    # LOAD CP EXCEL COLUMNS FOR HELP / VALIDATION
     # =====================
     df = read_excel_from_blob(BLOB_NAME_A1, logger=bootstrap_logger)
-    bootstrap_logger.info(f"✅ Loaded {len(df)} rows from blob {BLOB_NAME_A1} in container {BLOB_CONTAINER}")
-
-    cp_columns = list(df.columns)
-
-    parser = argparse.ArgumentParser(
-        description=f"Update PM.com projects and Smartsheet from CP Excel feed.\n\n"
-                    f"Available fields for filtering:\n  {', '.join(cp_columns)}"
+    bootstrap_logger.info(
+        f"✅ Loaded {len(df)} rows from blob {BLOB_NAME_A1} "
+        f"in container {BLOB_CONTAINER}"
     )
 
-    parser.add_argument("--newlog", action="store_true")
-    parser.add_argument("--filter", action="append")
-    parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--not-allowed-status", action="append")
-
-    args = parser.parse_args()
-
-    # If neither VBA nor CLI requested logging mode → default to newlog
-    if not args.newlog:
-        args.newlog = True
+    cp_columns = list(df.columns)
+    bootstrap_logger.info(
+        f"Available CP fields for filtering: {', '.join(cp_columns)}"
+    )
 
     # =====================
-    # RUN PMCOM UPDATE
+    # RUN PM.COM UPDATE
     # =====================
     try:
-        run_cp_to_pmcom()
+        run_cp_to_pmcom(
+            filters=FILTERS,
+            debug=DEBUG,
+            not_allowed_statuses=NOT_ALLOWED_STATUSES,
+        )
     except Exception as e:
-        bootstrap_logger.error(f"❌ Smartsheet update failed: {e}")
+        bootstrap_logger.error(f"❌ PM.com update failed: {e}", exc_info=True)
 
     # =====================
     # RUN SMARTSHEET UPDATE A1
     # =====================
     try:
-        run_cp_to_smartsheet(sheet_id=864938054602628, blob_name=BLOB_NAME_A1)  # A1 data
+        run_cp_to_smartsheet(
+            sheet_id=864938054602628,
+            blob_name=BLOB_NAME_A1,
+            debug=DEBUG,
+        )
     except Exception as e:
-        bootstrap_logger.error(f"❌ Smartsheet update failed: {e}")
+        bootstrap_logger.error(f"❌ Smartsheet A1 update failed: {e}", exc_info=True)
 
     # =====================
     # RUN SMARTSHEET UPDATE A4
     # =====================
     try:
-        run_cp_to_smartsheet(sheet_id=2469989006135172, blob_name=BLOB_NAME_A4)  # A3 data
+        run_cp_to_smartsheet(
+            sheet_id=2469989006135172,
+            blob_name=BLOB_NAME_A4,
+            debug=DEBUG,
+        )
     except Exception as e:
-        bootstrap_logger.error(f"❌ Smartsheet update failed: {e}")
+        bootstrap_logger.error(f"❌ Smartsheet A4 update failed: {e}", exc_info=True)

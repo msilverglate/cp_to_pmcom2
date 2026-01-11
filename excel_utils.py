@@ -4,7 +4,7 @@ import io
 import pandas as pd
 from azure.storage.blob import BlobServiceClient
 
-BLOB_CONTAINER = os.environ.get("BLOB_BLOB_CONTAINER", "blob1")
+BLOB_CONTAINER = os.environ.get("BLOB_CONTAINER_NAME", "blob1")
 STORAGE_CONN_STR = os.environ["AzureWebJobsStorage"]
 
 def read_excel_from_blob(blob_name, logger):
