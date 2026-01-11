@@ -278,8 +278,6 @@ def get_project_status(response_json):
 # =====================
 # APPLY LEVEL 6 HOURS ENG PM TRV DNB AT PROJECT LEVEL
 # =====================
-
-
 def apply_level6_hours_to_pm_fields(df, logger, debug=False):
     """
     Updates a DataFrame by placing Level 6 'Entered Hours' into PM-specific columns,
@@ -326,84 +324,6 @@ def apply_level6_hours_to_pm_fields(df, logger, debug=False):
 
     return df
 
-
-def apply_level6_hours_to_pm_fields_old(df, logger=None, debug=False):
-    """
-    Extract Level 6 suffix from Project ID and copy Entered Hours
-    into exactly one PM.com project field per row.
-
-    Supported suffixes:
-      ENG → CP ENG ACT HRS
-      PM1 → CP PM1 ACT HRS
-      DNB → CP DNB ACT HRS
-      TRV → CP TRV ACT HRS
-
-    Only rows with a Level 6 suffix are processed.
-    NaN values are converted to 0.0.
-    """
-
-    # Normalize Project ID
-    df["Project ID"] = df["Project ID"].astype(str).str.strip()
-
-    # Ensure Entered Hours exists
-    if "Entered Hours" not in df.columns:
-        df["Entered Hours"] = 0.0
-    df["Entered Hours"] = df["Entered Hours"].fillna(0.0)
-
-    # Initialize PM.com fields
-    pm_fields = {
-        "ENG": "CP ENG ACT HRS",
-        "PM1": "CP PM1 ACT HRS",
-        "DNB": "CP DNB ACT HRS",
-        "TRV": "CP TRV ACT HRS"
-    }
-    for col in pm_fields.values():
-        df[col] = 0.0  # initialize to zero
-
-    # Apply hours only for Level 6 suffixes (last group after .)
-    level6_suffix_pattern = re.compile(r"^(?:[^.]+\.){5}([A-Z0-9]+)$")
-
-    for idx, row in df.iterrows():
-        match = level6_suffix_pattern.match(row["Project ID"])
-        if not match:
-            continue  # skip if not Level 6
-
-        suffix = match.group(1)
-        if suffix in pm_fields:
-            df.at[idx, pm_fields[suffix]] = row["Entered Hours"]
-
-    # Log unknown suffixes
-    if logger:
-        known_suffixes = set(pm_fields.keys())
-        level6_suffixes = df["Project ID"].map(lambda pid: level6_suffix_pattern.match(pid).group(1) if level6_suffix_pattern.match(pid) else None)
-        unknown_suffixes = set(filter(None, level6_suffixes)) - known_suffixes
-        if unknown_suffixes:
-            logger.warning(f"Unknown Level 6 suffixes found: {unknown_suffixes}")
-
-        # ----------------------------
-        # Debug output (non-zero examples)
-        # ----------------------------
-    if debug:
-        pm_columns = list(pm_fields.values())
-
-        # Build a mask dynamically
-        mask = df[pm_columns].ne(0).any(axis=1)  # True for rows where any PM field != 0
-
-        # Select debug columns
-        debug_cols = ["Project ID", "Entered Hours"] + pm_columns
-
-        non_zero_df = df.loc[mask, debug_cols].head(1000)
-
-        if logger:
-            logger.info("Sample rows with non-zero Level 6 PM.com hours:")
-            logger.info(
-                "\n" + non_zero_df.to_string(index=False)
-            )
-        else:
-            print("\nSample rows with non-zero Level 6 PM.com hours:")
-            print(non_zero_df.to_string(index=False))
-
-    return df
 
 # =====================
 # READ CP FILE WITH FILTERING
