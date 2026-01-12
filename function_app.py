@@ -1,4 +1,4 @@
-## Version 2.41 Add timestamp and fixed nan values in Entered Hours option for pycharm, PMCOM update only
+## Version 2.5 Add timestamp comparison no native or proj custom field updates if data already imported
 
 import requests
 import re
@@ -15,7 +15,6 @@ from logging_utils import setup_blob_logger
 from excel_utils import read_excel_from_blob
 from smartsheet_utils import clear_smartsheet, reduce_columns
 from azure.storage.queue import QueueClient
-
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,7 +42,6 @@ headers = {
     "Accept": "application/json",
     "Content-Type": "application/json"
 }
-
 
 # === DATA DICTIONARY ===
 
@@ -216,7 +214,7 @@ def load_data_dictionary(logger):
 
     try:
         # Attempt to load from Azure blob
-        df= read_excel_from_blob(blob_dict_name,logger)
+        df = read_excel_from_blob(blob_dict_name, logger)
 
         # Clean column names
         df.columns = [c.strip() for c in df.columns]
@@ -334,6 +332,7 @@ def apply_level6_hours_to_pm_fields(df, logger, debug=False):
 
     return df
 
+
 # =====================
 # READ CP FILE WITH FILTERING
 # =====================
@@ -414,6 +413,9 @@ def filterCPProjectsToUpdate(data_dict, filters=None, debug=False, logger=None):
         # Preserve original row for traceability
         project_data["source_row"] = row
 
+        # Inject Costpoint Update Date at top level
+        project_data["Costpoint Update Date"] = row.get("Costpoint Update Date")
+
         # Map and transform fields using data dictionary
         for output_field, metadata in data_dict.items():
             source_column = metadata["cp_source"]
@@ -478,8 +480,8 @@ def update_pmcom_matching_projects(projects, data_dict, not_allowed_statuses, de
     Optimized version:
     - Single GET to fetch all project tasks
     - Local filtering of fieldValues
-    - Skip updates when field already has value (ifBlank rule)
-    - Skip projects with disallowed statuses
+    - Skip project updates when CP timestamp unchanged
+    - Task updates ALWAYS run (never timestamp-gated)
     """
 
     project_field_ids = load_project_field_ids()
@@ -488,8 +490,8 @@ def update_pmcom_matching_projects(projects, data_dict, not_allowed_statuses, de
     if debug:
         projects = projects[:2]
         logger.info(f"=== DEBUG MODE: Limiting to {len(projects)} project(s) ===")
-    for i, proj in enumerate(projects, start=1):
 
+    for i, proj in enumerate(projects, start=1):
         short_code = proj["shortCode"]
 
         # ───────────────────────────────────────────────
@@ -497,13 +499,6 @@ def update_pmcom_matching_projects(projects, data_dict, not_allowed_statuses, de
         # ───────────────────────────────────────────────
         url = f"{BASE_URL}/projects?%24top=1&%24filter=shortCode%20eq%20'{short_code}'"
         resp = requests.get(url, headers=headers)
-
-        if debug:
-            logger.info(f"[DEBUG] GET {url} -> Status: {resp.status_code}")
-            try:
-                logger.info(json.dumps(resp.json(), indent=2))
-            except Exception:
-                logger.info(resp.text)
 
         resp_json = resp.json()
         data = resp_json.get("data", [])
@@ -534,39 +529,68 @@ def update_pmcom_matching_projects(projects, data_dict, not_allowed_statuses, de
         logger.info(f"=== Project {i}/{len(projects)}: {project_name} ===")
 
         # ───────────────────────────────────────────────
-        # 3. GET ALL TASKS IN ONE CALL
-        #    Eliminates 20–300 GET calls ✔
+        # 3. Timestamp comparison (project-level only)
+        # ───────────────────────────────────────────────
+        from dateutil.parser import parse
+        from dateutil.tz import tzutc
+
+        # Convert sheet timestamp to datetime with UTC
+        sheet_ts_raw = proj["Costpoint Update Date"]  # your “injected” timestamp
+        assert sheet_ts_raw is not None, "Costpoint Update Date missing from DataFrame row"
+
+        sheet_ts_dt = parse(sheet_ts_raw) if sheet_ts_raw else None
+
+        # Ensure UTC / tz-aware
+        if sheet_ts_dt and sheet_ts_dt.tzinfo is None:
+            sheet_ts_dt = sheet_ts_dt.replace(tzinfo=tzutc())
+
+        # Convert PM.com timestamp to datetime
+        pm_ts_str = next(
+            (
+                f["value"]
+                for f in project.get("fieldValues", [])
+                if f.get("name") == "CP Update Timestamp"
+            ),
+            None
+        )
+
+        pm_ts_dt = parse(pm_ts_str) if pm_ts_str else None
+
+        # Compare
+        cp_data_is_new = not pm_ts_dt or sheet_ts_dt > pm_ts_dt
+
+        if debug:
+            logger.info(
+                f"Sheet timestamp: {sheet_ts_dt} | "
+                f"PM.com timestamp: {pm_ts_dt} | "
+                f"Is new data: {cp_data_is_new}"
+            )
+
+        # ───────────────────────────────────────────────
+        # 4. GET ALL TASKS (always)
         # ───────────────────────────────────────────────
         tasks = load_project_tasks(project_id, logger)
-
         logger.info(f"Loaded {len(tasks)} tasks for this project")
 
         if debug:
             tasks = tasks[:10]
             logger.info(f"*** DEBUG MODE: Limiting to {len(tasks)} tasks ***")
 
-        # Preload task field definitions once per project
         task_field_ids = load_task_field_ids(project_id)
-
-        # Convert list of tasks → dict by ID for fast lookup
         task_dict = {t["id"]: t for t in tasks}
 
-        # Build lookup for task custom field values PER TASK (local)
-        # Example: task_field_map[task_id]['nav id'] = "ABC-123"
         task_field_map = {}
-
         for t in tasks:
             tf = {}
             for fv in t.get("fieldValues", []):
-                fname = fv["name"].lower()
-                tf[fname] = fv.get("value")
+                tf[fv["name"].lower()] = fv.get("value")
             task_field_map[t["id"]] = tf
 
         # ───────────────────────────────────────────────
-        # 4. PROCESS ALL CP→PM FIELDS
+        # 5. PROCESS ALL CP → PM FIELDS
         # ───────────────────────────────────────────────
         for key, meta in data_dict.items():
-            value = str(proj[key]) if proj[key] is not None else None
+            value = str(proj[key]) if proj.get(key) is not None else None
             field_type = meta["field_type"]
             pm_field = meta["pm_field"].lower()
             rule = meta["update"]
@@ -574,45 +598,57 @@ def update_pmcom_matching_projects(projects, data_dict, not_allowed_statuses, de
             if value is None:
                 continue
 
-            # PROJECT NATIVE FIELD
+            # ───────────────────────────────────────────
+            # PROJECT NATIVE FIELD (timestamp gated)
+            # ───────────────────────────────────────────
             if field_type == "ProjNative":
-                logger.info(f"Updating project native field {pm_field}: {value}")
+                if not cp_data_is_new:
+                    logger.info(
+                        f"[SKIP] Project native field {pm_field} "
+                        f"(CP timestamp unchanged)")
+                    continue
 
+                logger.info(f"Updating project native field {pm_field}: {value}")
                 put_url = f"{BASE_URL}/projects/{project_id}"
-                payload = {pm_field: value}
-                r = requests.put(put_url, headers=headers, json=payload)
+                r = requests.put(put_url, headers=headers, json={pm_field: value})
 
                 if debug:
                     logger.info(f"[DEBUG] PUT {put_url} -> {r.status_code}")
 
-            # PROJECT CUSTOM FIELD
+            # ───────────────────────────────────────────
+            # PROJECT CUSTOM FIELD (timestamp gated)
+            # ───────────────────────────────────────────
             elif field_type == "ProjCustom":
+                if not cp_data_is_new:
+                    logger.info(
+                        f"[SKIP] Project native field {pm_field} "
+                        f"(CP timestamp unchanged)")
+                    continue
+
                 field_id = project_field_ids.get(pm_field)
                 if not field_id:
                     logger.warning(f"[WARN] Project field '{pm_field}' not found")
                     continue
 
-                # Only GET once if rule == ifBlank
                 if rule == "ifBlank":
                     get_url = f"{BASE_URL}/projects/{project_id}/fields/{field_id}"
                     r = requests.get(get_url, headers=headers)
                     existing = r.json().get("data", {}).get("value")
 
                     if existing not in (None, "", " "):
-                        if debug:
-                            logger.info(f"[SKIP] Project custom field {pm_field} already has value: {existing}")
                         continue
 
                 logger.info(f"Updating project custom field {pm_field}: {value}")
-
                 put_url = f"{BASE_URL}/projects/{project_id}/fields/{field_id}"
                 r = requests.put(put_url, headers=headers, json={"value": value})
 
                 if debug:
                     logger.info(f"[DEBUG] PUT {put_url} -> {r.status_code}")
-                    logger.info(f"[DEBUG] PUT payload for {pm_field}: {str(value)}")
+                    logger.info(f"[DEBUG] PUT payload for {pm_field}: {value}")
 
-            # TASK CUSTOM FIELD (FAST MODE, NO PER-TASK GET)
+            # ───────────────────────────────────────────
+            # TASK CUSTOM FIELD (NEVER timestamp gated)
+            # ───────────────────────────────────────────
             elif field_type == "TaskCustom":
                 field_id = task_field_ids.get(pm_field)
                 if not field_id:
@@ -622,14 +658,11 @@ def update_pmcom_matching_projects(projects, data_dict, not_allowed_statuses, de
                 logger.info(f"Updating task custom field {pm_field} for {len(tasks)} tasks")
 
                 for task_id in task_dict.keys():
-
                     existing = task_field_map[task_id].get(pm_field)
 
-                    # Skip per rules
                     if rule == "ifBlank" and existing not in (None, "", " "):
                         continue
 
-                    # Skip if value already matches (avoid unnecessary calls)
                     if existing == value:
                         continue
 
@@ -830,6 +863,7 @@ def run_cp_to_smartsheet(sheet_id: int, blob_name: str, debug=False):
         logger.info(f"End time: {datetime.now()}")
         upload_log()
 
+
 #  from function_app import run_cp_to_smartsheet  # adjust import as needed
 
 # ---------------------------
@@ -861,10 +895,12 @@ def CostpointToSmartsheetQueue(msg: func.QueueMessage):
         bootstrap_logger.exception(f"Error processing queue message: {e}")
         raise  # ensures message goes to poison queue if it fails
 
+
 # ---------------------------
 # HTTP-triggered function to enqueue messages
 # ---------------------------
 QUEUE_NAME = "cp-smartsheet-queue"
+
 
 @app.function_name(name="CostpointToSmartsheet")
 @app.route(route="CostpointToSmartsheet", methods=["POST"])
@@ -916,6 +952,7 @@ def CostpointToSmartsheetA4(req: func.HttpRequest):
     except Exception as e:
         return func.HttpResponse(str(e), status_code=500)
 
+
 if __name__ == "__main__":
 
     # =====================
@@ -923,8 +960,8 @@ if __name__ == "__main__":
     # =====================
     DEBUG = False
     UPDATE_PMCOMONLY = True
-    FILTERS = ["Project Manager Name=%Silverglate%"]     # e.g. ["PROJ_MGR_NAME=Russell"]
-    NOT_ALLOWED_STATUSES = ["CLOSED"]        # e.g. ["CLOSED", "ON_HOLD"]
+    FILTERS = ["Project Manager Name=%Silverglate%"]  # e.g. ["PROJ_MGR_NAME=Russell"]
+    NOT_ALLOWED_STATUSES = ["CLOSED"]  # e.g. ["CLOSED", "ON_HOLD"]
 
     # =====================
     # LOAD CP EXCEL COLUMNS FOR HELP / VALIDATION
