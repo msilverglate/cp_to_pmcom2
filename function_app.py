@@ -1,4 +1,4 @@
-## Version 2.3 Level 6 Hours Entered and Local run w/local variables
+## Version 2.4 Add timestamp
 
 import requests
 import re
@@ -50,6 +50,13 @@ headers = {
 DEFAULT_DATA_DICTIONARY = '''
 
 {
+    "cpTimeStamp": {
+    "cp_source": "Costpoint Update Date",
+    "field_type": "ProjCustom",
+    "pm_field": "CP Update Timestamp",
+    "update": "Always",
+    "transform": null
+  },
   "revisedEndDt": {
     "cp_source": "PJ UDEF Date 1",
     "field_type": "ProjNative",
@@ -209,7 +216,7 @@ def load_data_dictionary(logger):
 
     try:
         # Attempt to load from Azure blob
-        df = read_excel_from_blob(blob_dict_name,logger)
+        df= read_excel_from_blob(blob_dict_name,logger)
 
         # Clean column names
         df.columns = [c.strip() for c in df.columns]
@@ -278,6 +285,8 @@ def get_project_status(response_json):
 # =====================
 # APPLY LEVEL 6 HOURS ENG PM TRV DNB AT PROJECT LEVEL
 # =====================
+
+
 def apply_level6_hours_to_pm_fields(df, logger, debug=False):
     """
     Updates a DataFrame by placing Level 6 'Entered Hours' into PM-specific columns,
@@ -323,7 +332,6 @@ def apply_level6_hours_to_pm_fields(df, logger, debug=False):
                 logger.info(f"[DEBUG] Level 5 {pid} roll-up -> {col_name} = {total}")
 
     return df
-
 
 # =====================
 # READ CP FILE WITH FILTERING
@@ -771,8 +779,15 @@ def run_cp_to_smartsheet(sheet_id: int, blob_name: str, debug=False):
         logger.info(f"=== CP → Smartsheet Sync Started ({blob_name}) ===")
         logger.info(f"Start time: {datetime.now()}")
 
+        # Unpack DataFrame and timestamp
         df = read_excel_from_blob(blob_name, logger)
 
+        # Log the Costpoint extract timestamp for this sheet
+        if "Costpoint Update Date" in df.columns:
+            sheet_ts = df["cp_sheet_ts"].iloc[0]  # all rows have same timestamp
+            logger.info(f"Costpoint sheet timestamp: {sheet_ts}")
+        else:
+            logger.warning("No Costpoint timestamp column found in DataFrame")
         sheet = smartsheet_client.Sheets.get_sheet(sheet_id)
         logger.info(f"Loaded Smartsheet '{sheet.name}' with {len(sheet.rows)} existing rows")
 
@@ -906,7 +921,7 @@ if __name__ == "__main__":
     # =====================
     # LOCAL CONFIG (edit here)
     # =====================
-    DEBUG = False
+    DEBUG = True
 
     FILTERS = ["Project Manager Name=%Silverglate%"]     # e.g. ["PROJ_MGR_NAME=Russell"]
     NOT_ALLOWED_STATUSES = ["CLOSED"]        # e.g. ["CLOSED", "ON_HOLD"]
@@ -915,9 +930,9 @@ if __name__ == "__main__":
     # LOAD CP EXCEL COLUMNS FOR HELP / VALIDATION
     # =====================
     df = read_excel_from_blob(BLOB_NAME_A1, logger=bootstrap_logger)
+
     bootstrap_logger.info(
         f"✅ Loaded {len(df)} rows from blob {BLOB_NAME_A1} "
-        f"in container {BLOB_CONTAINER}"
     )
 
     cp_columns = list(df.columns)
@@ -939,7 +954,7 @@ if __name__ == "__main__":
 
     # =====================
     # RUN SMARTSHEET UPDATE A1
-    # =====================
+    # # =====================
     try:
         run_cp_to_smartsheet(
             sheet_id=864938054602628,
