@@ -1,4 +1,4 @@
-## Version 2.4 Add timestamp
+## Version 2.41 Add timestamp and fixed nan values in Entered Hours option for pycharm, PMCOM update only
 
 import requests
 import re
@@ -286,7 +286,6 @@ def get_project_status(response_json):
 # APPLY LEVEL 6 HOURS ENG PM TRV DNB AT PROJECT LEVEL
 # =====================
 
-
 def apply_level6_hours_to_pm_fields(df, logger, debug=False):
     """
     Updates a DataFrame by placing Level 6 'Entered Hours' into PM-specific columns,
@@ -314,7 +313,9 @@ def apply_level6_hours_to_pm_fields(df, logger, debug=False):
 
         suffix = match.group(1)
         if suffix in pm_fields:
-            df.at[idx, pm_fields[suffix]] = row.get("Entered Hours", 0.0)
+            # Safely set the value, defaulting to 0.0 if missing or NaN
+            entered_hours = row.get("Entered Hours", 0.0)
+            df.at[idx, pm_fields[suffix]] = 0.0 if pd.isna(entered_hours) else entered_hours
             if debug:
                 logger.info(
                     f"[DEBUG] Level 6 {row['Project ID']} -> {pm_fields[suffix]} = {df.at[idx, pm_fields[suffix]]}")
@@ -784,7 +785,7 @@ def run_cp_to_smartsheet(sheet_id: int, blob_name: str, debug=False):
 
         # Log the Costpoint extract timestamp for this sheet
         if "Costpoint Update Date" in df.columns:
-            sheet_ts = df["cp_sheet_ts"].iloc[0]  # all rows have same timestamp
+            sheet_ts = df["Costpoint Update Date"].iloc[0]  # all rows have same timestamp
             logger.info(f"Costpoint sheet timestamp: {sheet_ts}")
         else:
             logger.warning("No Costpoint timestamp column found in DataFrame")
@@ -915,14 +916,13 @@ def CostpointToSmartsheetA4(req: func.HttpRequest):
     except Exception as e:
         return func.HttpResponse(str(e), status_code=500)
 
-
 if __name__ == "__main__":
 
     # =====================
     # LOCAL CONFIG (edit here)
     # =====================
-    DEBUG = True
-
+    DEBUG = False
+    UPDATE_PMCOMONLY = True
     FILTERS = ["Project Manager Name=%Silverglate%"]     # e.g. ["PROJ_MGR_NAME=Russell"]
     NOT_ALLOWED_STATUSES = ["CLOSED"]        # e.g. ["CLOSED", "ON_HOLD"]
 
@@ -955,23 +955,24 @@ if __name__ == "__main__":
     # =====================
     # RUN SMARTSHEET UPDATE A1
     # # =====================
-    try:
-        run_cp_to_smartsheet(
-            sheet_id=864938054602628,
-            blob_name=BLOB_NAME_A1,
-            debug=DEBUG,
-        )
-    except Exception as e:
-        bootstrap_logger.error(f"❌ Smartsheet A1 update failed: {e}", exc_info=True)
+    if not UPDATE_PMCOMONLY:
+        try:
+            run_cp_to_smartsheet(
+                sheet_id=864938054602628,
+                blob_name=BLOB_NAME_A1,
+                debug=DEBUG,
+            )
+        except Exception as e:
+            bootstrap_logger.error(f"❌ Smartsheet A1 update failed: {e}", exc_info=True)
 
-    # =====================
-    # RUN SMARTSHEET UPDATE A4
-    # =====================
-    try:
-        run_cp_to_smartsheet(
-            sheet_id=2469989006135172,
-            blob_name=BLOB_NAME_A4,
-            debug=DEBUG,
-        )
-    except Exception as e:
-        bootstrap_logger.error(f"❌ Smartsheet A4 update failed: {e}", exc_info=True)
+        # =====================
+        # RUN SMARTSHEET UPDATE A4
+        # =====================
+        try:
+            run_cp_to_smartsheet(
+                sheet_id=2469989006135172,
+                blob_name=BLOB_NAME_A4,
+                debug=DEBUG,
+            )
+        except Exception as e:
+            bootstrap_logger.error(f"❌ Smartsheet A4 update failed: {e}", exc_info=True)
