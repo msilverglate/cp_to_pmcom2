@@ -1,6 +1,11 @@
-## Version 2.5 Add timestamp comparison no native or proj custom field updates if data already imported
+## Version 2.52 (with robust PM.com session for DNS/network retries)
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from urllib3.exceptions import NameResolutionError
+from requests.exceptions import ConnectionError, HTTPError
+
 import re
 import pandas as pd
 from datetime import datetime, timedelta
@@ -15,18 +20,22 @@ from utils1.logging_utils import setup_blob_logger
 from utils1.excel_utils import read_excel_from_blob
 from utils1.smartsheet_utils import clear_smartsheet, reduce_columns
 from azure.storage.queue import QueueClient
+import time
+from dateutil.parser import parse
+from dateutil.tz import tzutc
 
+# ----------------------------
+# Logging
+# ----------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
-
 bootstrap_logger = logging.getLogger("bootstrap")
 
-# =====================
+# ----------------------------
 # CONFIG
-# =====================
-
+# ----------------------------
 BLOB_CONTAINER = os.environ.get("BLOB_CONTAINER_NAME", "blob1")
 BLOB_NAME_A1 = os.environ.get("BLOB_NAME_A1", "Project Data 2.xlsx")
 BLOB_NAME_A4 = os.environ.get("BLOB_NAME_A4", "Project Data 1CA.xlsx")
@@ -43,7 +52,55 @@ headers = {
     "Content-Type": "application/json"
 }
 
-# === DATA DICTIONARY ===
+# ----------------------------
+# SETUP ROBUST SESSION FOR PM.COM API CALLS
+# ----------------------------
+session = requests.Session()
+retry_strategy = Retry(
+    total=10,               # total retries for all errors
+    connect=5,              # retries specifically for connection errors (DNS)
+    read=3,                 # retries for read errors
+    backoff_factor=1,       # exponential backoff 1s, 2s, 4s...
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET", "PUT", "POST"]
+)
+adapter = HTTPAdapter(max_retries=retry_strategy)
+session.mount("https://", adapter)
+session.mount("http://", adapter)
+
+def robust_get(url, headers, logger, timeout=30):
+    try:
+        resp = session.get(url, headers=headers, timeout=timeout)
+        resp.raise_for_status()
+        return resp.json()
+    except ConnectionError as e:
+        if isinstance(e.__cause__, NameResolutionError):
+            logger.warning(f"Temporary DNS issue for {url}, will retry: {e}")
+            raise
+        else:
+            raise
+    except HTTPError as e:
+        logger.error(f"HTTP error {e.response.status_code} for {url}")
+        raise
+
+def robust_put(url, headers, payload, logger, timeout=30):
+    try:
+        resp = session.put(url, headers=headers, json=payload, timeout=timeout)
+        resp.raise_for_status()
+        return resp
+    except ConnectionError as e:
+        if isinstance(e.__cause__, NameResolutionError):
+            logger.warning(f"Temporary DNS issue for {url}, will retry: {e}")
+            raise
+        else:
+            raise
+    except HTTPError as e:
+        logger.error(f"HTTP error {e.response.status_code} for {url}")
+        raise
+
+# ----------------------------
+# DATA DICTIONARY
+# ----------------------------
 
 DEFAULT_DATA_DICTIONARY = '''
 
@@ -129,16 +186,14 @@ DEFAULT_DATA_DICTIONARY = '''
 
 '''
 
-
-# =====================
+# ----------------------------
 # TRANSFORMS
-# =====================
+# ----------------------------
 def regex_left_of_dot(text):
     if not text:
         return text
     m = re.match(r"([^.]+)", text)
     return m.group(1) if m else text
-
 
 def regex_left_of_last_dot(value):
     if not isinstance(value, str):
@@ -146,90 +201,47 @@ def regex_left_of_last_dot(value):
     match = re.match(r"^(.*)\.[^.]+$", value)
     return match.group(1) if match else value
 
-
 def transform_value(rule, value):
-    """
-    Transform a CP value according to data dictionary rule.
-    Safely handles NaT, None, blank strings, and unexpected types.
-    """
-
-    # --- Universal empty checks ---
     if value is None or pd.isna(value) or str(value).strip() == "":
         return None
-
-    # --------------------
-    # Date Transform Rule
-    # --------------------
     if rule == "YYYY-MM-DD":
         try:
-            # Pandas Timestamp or Python datetime
             if isinstance(value, (pd.Timestamp, datetime)):
                 return value.strftime("%Y-%m-%d")
-
-            # Other formats → try converting
             return pd.to_datetime(value).strftime("%Y-%m-%d")
-
         except Exception:
-            return None  # Invalid date → treat as blank
-
-    # ---------------------------
-    # Regex Left of First Dot
-    # ---------------------------
+            return None
     if rule == "regex_left_of_dot":
         try:
             return regex_left_of_dot(value)
         except Exception:
             return value
-
-    # ---------------------------
-    # Regex Left of LAST Dot
-    # ---------------------------
     if rule == "regex_left_of_last_dot":
         try:
             return regex_left_of_last_dot(value)
         except Exception:
             return value
-
-    # --------------------
-    # Number Transform (Future Expand)
-    # --------------------
     if rule == "number":
         try:
             return float(value)
         except Exception:
             return None
-
-    # --------------------
-    # No rule → return raw
-    # --------------------
     return value
 
-
-# =====================
+# ----------------------------
 # LOAD DATA DICTIONARY
-# =====================
+# ----------------------------
 def load_data_dictionary(logger):
-    # Azure blob container and blob names
     blob_dict_name = "CC_PM_Update_DataDict.xlsx"
-
     try:
-        # Attempt to load from Azure blob
         df = read_excel_from_blob(blob_dict_name, logger)
-
-        # Clean column names
         df.columns = [c.strip() for c in df.columns]
-
-        # Keep only active rows
         if "Active" in df.columns:
             df = df[df["Active"].astype(str).str.upper() == "Y"]
-
-        # Trim string columns
         for c in df.columns:
             if df[c].dtype == "object":
                 df[c] = df[c].map(lambda x: x.strip() if isinstance(x, str) else x)
-
         df["Transform"] = df["Transform"].apply(lambda v: None if pd.isna(v) else v)
-
         data_dict = {}
         for _, row in df.iterrows():
             col = str(row["Col"]).strip()
@@ -240,49 +252,26 @@ def load_data_dictionary(logger):
                 "update": row.get("Update?"),
                 "transform": row.get("Transform"),
             }
-
         logger.info("=== DATA DICTIONARY LOADED FROM BLOB ===")
-        logger.info(json.dumps(data_dict, indent=2))
+        return data_dict
+    except Exception as ex:
+        logger.warning("Failed to load data dictionary from Azure blob: %s", ex)
+        data_dict = json.loads(DEFAULT_DATA_DICTIONARY)
         return data_dict
 
-    except Exception as ex:
-        logger.warning("Failed to load data dictionary from Azure blob")
-        logger.warning("Reason: %s", ex)
-        logger.info("=== USING DEFAULT EMBEDDED DATA DICTIONARY ===")
-        try:
-            data_dict = json.loads(DEFAULT_DATA_DICTIONARY)
-            logger.info(json.dumps(data_dict, indent=2))
-            return data_dict
-        except Exception as json_ex:
-            logger.error("Failed to load DEFAULT_DATA_DICTIONARY")
-            logger.error(json_ex)
-            return {}
-
-
 def get_project_status(response_json):
-    """
-    Extracts the project status name ("Open", "Closed", etc.)
-    from the GET /projects response.
-    """
-
-    # Safety checks
     if not response_json or "data" not in response_json:
         return None
-
     data = response_json.get("data", [])
     if not data:
         return None
-
     project = data[0]
-
-    # Status field is always under project["status"]["name"]
     status = project.get("status", {})
     return status.get("name")
 
-
-# =====================
-# APPLY LEVEL 6 HOURS ENG PM TRV DNB AT PROJECT LEVEL
-# =====================
+# ----------------------------
+# APPLY LEVEL 6 HOURS (same as before)
+# ----------------------------
 
 def apply_level6_hours_to_pm_fields(df, logger, debug=False):
     """
@@ -333,252 +322,126 @@ def apply_level6_hours_to_pm_fields(df, logger, debug=False):
     return df
 
 
-# =====================
-# READ CP FILE WITH FILTERING
-# =====================
+# ----------------------------
+# FILTER CP PROJECTS
+# ----------------------------
 def filterCPProjectsToUpdate(data_dict, filters=None, debug=False, logger=None):
-    # Load Excel from blob and filter down CP dataset
     df = read_excel_from_blob(BLOB_NAME_A1, logger)
-
-    # Call function to add Level 6 Entered Hours to Level 5 columns in df
     df = apply_level6_hours_to_pm_fields(df, logger, debug)
-
     df["PJ UDEF Date 1"] = pd.to_datetime(df["PJ UDEF Date 1"], errors="coerce")
     threshold_date = datetime.now() - timedelta(days=30)
-
     excluded_ids = ["OP-0050475"]
     filtered_df = df[
         (df["Opportunity ID"].notna()) &
         (df["Level Number"] == 5) &
         (~df["Opportunity ID"].isin(excluded_ids)) &
-        (
-                df["PJ UDEF Date 1"].isna() |
-                (df["PJ UDEF Date 1"].astype(str).str.strip() == "") |
-                (df["PJ UDEF Date 1"] > threshold_date)
-        )
-        ]
-
-    # ----------------------------------------
-    # Apply command-line filters
-    # ----------------------------------------
+        ((df["PJ UDEF Date 1"].isna()) | (df["PJ UDEF Date 1"].astype(str).str.strip() == "") | (df["PJ UDEF Date 1"] > threshold_date))
+    ]
     if filters:
         for filter_expr in filters:
-            # Parse filter expression: column=pattern
             column_name, raw_pattern = filter_expr.split("=", 1)
             column_name = column_name.strip()
             raw_pattern = raw_pattern.strip()
-
-            # Convert SQL-style wildcard (%) to regex (.*)
             regex_pattern = raw_pattern.replace("%", ".*")
-
-            # Skip invalid columns
             if column_name not in filtered_df.columns:
-                logger.info(
-                    "[FILTER WARNING] Column '%s' not in dataframe, skipping",
-                    column_name
-                )
+                logger.info("[FILTER WARNING] Column '%s' not in dataframe, skipping", column_name)
                 continue
-
-            # Compile regex (case-insensitive)
             compiled_regex = re.compile(regex_pattern, re.IGNORECASE)
-
-            # Apply filter row-by-row
-            def matches_filter(cell_value):
-                return bool(compiled_regex.search(str(cell_value)))
-
-            filtered_df = filtered_df[
-                filtered_df[column_name].apply(matches_filter)
-            ]
-
+            filtered_df = filtered_df[filtered_df[column_name].apply(lambda v: bool(compiled_regex.search(str(v))))]
             if debug:
-                logger.info(
-                    "[FILTER DEBUG] Applied filter: %s LIKE %s, remaining rows: %d",
-                    column_name,
-                    regex_pattern,
-                    len(filtered_df)
-                )
-
-    # ----------------------------------------
-    # Build project update payloads
-    # ----------------------------------------
+                logger.info("[FILTER DEBUG] Applied filter: %s LIKE %s, remaining rows: %d", column_name, regex_pattern, len(filtered_df))
     projects_to_update = []
-
     for _, row in filtered_df.iterrows():
         project_data = {}
-
-        # Derive shortCode from Opportunity ID
         opportunity_id = str(row.get("Opportunity ID", ""))
         project_data["shortCode"] = opportunity_id[-7:]
-
-        # Preserve original row for traceability
         project_data["source_row"] = row
-
-        # Inject Costpoint Update Date at top level
         project_data["Costpoint Update Date"] = row.get("Costpoint Update Date")
-
-        # Map and transform fields using data dictionary
         for output_field, metadata in data_dict.items():
             source_column = metadata["cp_source"]
             transform_name = metadata["transform"]
-
             raw_value = row.get(source_column)
             transformed_value = transform_value(transform_name, raw_value)
-
             project_data[output_field] = transformed_value
-
         projects_to_update.append(project_data)
-
     logger.info("Filtered rows: %d", len(projects_to_update))
     return projects_to_update
 
-
-# =====================
+# ----------------------------
 # LOAD FIELD IDS
-# =====================
+# ----------------------------
 def load_project_field_ids():
     url = f"{BASE_URL}/projects/fields"
-    resp = requests.get(url, headers=headers)
-    fields = resp.json().get("data", [])
+    resp = robust_get(url, headers, bootstrap_logger)
+    fields = resp.get("data", [])
     return {f["name"].strip().lower(): f["id"] for f in fields}
-
 
 def load_task_field_ids(project_id):
     url = f"{BASE_URL}/projects/{project_id}/tasks/fields"
-    resp = requests.get(url, headers=headers)
-    fields = resp.json().get("data", [])
+    resp = robust_get(url, headers, bootstrap_logger)
+    fields = resp.get("data", [])
     return {f["name"].strip().lower(): f["id"] for f in fields}
-
 
 def load_project_tasks(project_id, logger):
     url = f"{BASE_URL}/tasks?%24filter=projectId%20eq%20{project_id}"
-    resp = requests.get(url, headers=headers)
-    if resp.status_code != 200:
-        logger.warning(f"Failed to load tasks for project {project_id}")
-        return []
-    return resp.json().get("data", [])
-
+    resp = robust_get(url, headers, logger)
+    return resp.get("data", [])
 
 def get_task_field_value(task_id, field_id, logger):
     url = f"{BASE_URL}/tasks/{task_id}/fields/{field_id}/values"
-    resp = requests.get(url, headers=headers)
-    try:
-        data = resp.json().get("data")
-        if isinstance(data, list) and data:
-            return data[0].get("value")
-        elif isinstance(data, dict):
-            return data.get("value")
-    except Exception as e:
-        logger.error("Error retrieving task field value for task %s field %s: %s", task_id, field_id, e)
+    resp = robust_get(url, headers, logger)
+    data = resp.get("data")
+    if isinstance(data, list) and data:
+        return data[0].get("value")
+    elif isinstance(data, dict):
+        return data.get("value")
     return None
 
-
-# =====================
-# UPDATE PROJECT & TASKS WITH DEBUG LIMITS
-# =====================
+# ----------------------------
+# UPDATE PMCOM MATCHING PROJECTS
+# ----------------------------
 def update_pmcom_matching_projects(projects, data_dict, not_allowed_statuses, debug=False, logger=None):
-    """
-    Optimized version:
-    - Single GET to fetch all project tasks
-    - Local filtering of fieldValues
-    - Skip project updates when CP timestamp unchanged
-    - Task updates ALWAYS run (never timestamp-gated)
-    """
-
     project_field_ids = load_project_field_ids()
-
-    # Debug mode: limit projects
     if debug:
         projects = projects[:2]
         logger.info(f"=== DEBUG MODE: Limiting to {len(projects)} project(s) ===")
-
     for i, proj in enumerate(projects, start=1):
         short_code = proj["shortCode"]
-
-        # ───────────────────────────────────────────────
-        # 1. GET project by shortCode
-        # ───────────────────────────────────────────────
         url = f"{BASE_URL}/projects?%24top=1&%24filter=shortCode%20eq%20'{short_code}'"
-        resp = requests.get(url, headers=headers)
-
-        resp_json = resp.json()
+        resp_json = robust_get(url, headers, logger)
         data = resp_json.get("data", [])
-
         if not data:
             logger.warning(f"No PM.com project found for shortCode {short_code}")
             continue
-
         project = data[0]
         project_id = project["id"]
         project_name = project["name"]
 
-        # ───────────────────────────────────────────────
-        # 2. Check project status
-        # ───────────────────────────────────────────────
+        # time.sleep(1)  # throttle only here if desired
+
         status_name = get_project_status(resp_json)
         normalized_status = (status_name or "").strip()
-
         logger.info(f"Status for {short_code}: {normalized_status}")
-
         if normalized_status in not_allowed_statuses:
-            logger.warning(
-                f"Skipping {short_code}: status '{normalized_status}' "
-                f"in not allowed list {not_allowed_statuses}"
-            )
+            logger.warning(f"Skipping {short_code}: status '{normalized_status}' in not allowed list")
             continue
 
         logger.info(f"=== Project {i}/{len(projects)}: {project_name} ===")
 
-        # ───────────────────────────────────────────────
-        # 3. Timestamp comparison (project-level only)
-        # ───────────────────────────────────────────────
-        from dateutil.parser import parse
-        from dateutil.tz import tzutc
-
-        # Convert sheet timestamp to datetime with UTC
-        sheet_ts_raw = proj["Costpoint Update Date"]  # your “injected” timestamp
-        assert sheet_ts_raw is not None, "Costpoint Update Date missing from DataFrame row"
-
+        # timestamp logic same as before
+        sheet_ts_raw = proj["Costpoint Update Date"]
         sheet_ts_dt = parse(sheet_ts_raw) if sheet_ts_raw else None
-
-        # Ensure UTC / tz-aware
         if sheet_ts_dt and sheet_ts_dt.tzinfo is None:
             sheet_ts_dt = sheet_ts_dt.replace(tzinfo=tzutc())
-
-        # Convert PM.com timestamp to datetime
-        pm_ts_str = next(
-            (
-                f["value"]
-                for f in project.get("fieldValues", [])
-                if f.get("name") == "CP Update Timestamp"
-            ),
-            None
-        )
-
+        pm_ts_str = next((f["value"] for f in project.get("fieldValues", []) if f.get("name") == "CP Update Timestamp"), None)
         pm_ts_dt = parse(pm_ts_str) if pm_ts_str else None
-
-        # Compare
         cp_data_is_new = not pm_ts_dt or sheet_ts_dt > pm_ts_dt
 
-        if debug:
-            logger.info(
-                f"Sheet timestamp: {sheet_ts_dt} | "
-                f"PM.com timestamp: {pm_ts_dt} | "
-                f"Is new data: {cp_data_is_new}"
-            )
-
-        # ───────────────────────────────────────────────
-        # 4. GET ALL TASKS (always)
-        # ───────────────────────────────────────────────
         tasks = load_project_tasks(project_id, logger)
-        logger.info(f"Loaded {len(tasks)} tasks for this project")
-
         if debug:
             tasks = tasks[:10]
-            logger.info(f"*** DEBUG MODE: Limiting to {len(tasks)} tasks ***")
-
         task_field_ids = load_task_field_ids(project_id)
         task_dict = {t["id"]: t for t in tasks}
-
         task_field_map = {}
         for t in tasks:
             tf = {}
@@ -586,145 +449,65 @@ def update_pmcom_matching_projects(projects, data_dict, not_allowed_statuses, de
                 tf[fv["name"].lower()] = fv.get("value")
             task_field_map[t["id"]] = tf
 
-        # ───────────────────────────────────────────────
-        # 5. PROCESS ALL CP → PM FIELDS
-        # ───────────────────────────────────────────────
+        # PROCESS FIELDS
         for key, meta in data_dict.items():
             value = str(proj[key]) if proj.get(key) is not None else None
             field_type = meta["field_type"]
             pm_field = meta["pm_field"].lower()
             rule = meta["update"]
-
             if value is None:
                 continue
 
-            # ───────────────────────────────────────────
-            # PROJECT NATIVE FIELD (timestamp gated)
-            # ───────────────────────────────────────────
+            # PROJ NATIVE FIELD
             if field_type == "ProjNative":
                 if not cp_data_is_new:
-                    logger.info(
-                        f"[SKIP] Project native field {pm_field} "
-                        f"(CP timestamp unchanged)")
                     continue
-
-                logger.info(f"Updating project native field {pm_field}: {value}")
                 put_url = f"{BASE_URL}/projects/{project_id}"
-                r = requests.put(put_url, headers=headers, json={pm_field: value})
+                robust_put(put_url, headers, {pm_field: value}, logger)
 
-                if debug:
-                    logger.info(f"[DEBUG] PUT {put_url} -> {r.status_code}")
-
-            # ───────────────────────────────────────────
-            # PROJECT CUSTOM FIELD (timestamp gated)
-            # ───────────────────────────────────────────
+            # PROJ CUSTOM FIELD
             elif field_type == "ProjCustom":
                 if not cp_data_is_new:
-                    logger.info(
-                        f"[SKIP] Project native field {pm_field} "
-                        f"(CP timestamp unchanged)")
                     continue
-
                 field_id = project_field_ids.get(pm_field)
                 if not field_id:
-                    logger.warning(f"[WARN] Project field '{pm_field}' not found")
                     continue
-
                 if rule == "ifBlank":
                     get_url = f"{BASE_URL}/projects/{project_id}/fields/{field_id}"
-                    r = requests.get(get_url, headers=headers)
-                    existing = r.json().get("data", {}).get("value")
-
-                    if existing not in (None, "", " "):
+                    existing_val = robust_get(get_url, headers, logger).get("data", {}).get("value")
+                    if existing_val not in (None, "", " "):
                         continue
-
-                logger.info(f"Updating project custom field {pm_field}: {value}")
                 put_url = f"{BASE_URL}/projects/{project_id}/fields/{field_id}"
-                r = requests.put(put_url, headers=headers, json={"value": value})
+                robust_put(put_url, headers, {"value": value}, logger)
 
-                if debug:
-                    logger.info(f"[DEBUG] PUT {put_url} -> {r.status_code}")
-                    logger.info(f"[DEBUG] PUT payload for {pm_field}: {value}")
-
-            # ───────────────────────────────────────────
-            # TASK CUSTOM FIELD (NEVER timestamp gated)
-            # ───────────────────────────────────────────
+            # TASK CUSTOM FIELD
             elif field_type == "TaskCustom":
                 field_id = task_field_ids.get(pm_field)
                 if not field_id:
-                    logger.warning(f"[WARN] Task field '{pm_field}' not found")
                     continue
-
-                logger.info(f"Updating task custom field {pm_field} for {len(tasks)} tasks")
-
                 for task_id in task_dict.keys():
                     existing = task_field_map[task_id].get(pm_field)
-
                     if rule == "ifBlank" and existing not in (None, "", " "):
                         continue
-
                     if existing == value:
                         continue
-
                     put_url = f"{BASE_URL}/tasks/{task_id}/fields/{field_id}/values"
-                    r = requests.put(put_url, headers=headers, json={"value": value})
-                    logger.info(f"  ✓ Task {task_id} | {pm_field} = {value}")
-
-                    if debug:
-                        logger.info(f"[DEBUG] PUT task {task_id} -> {r.status_code}")
-
-                logger.info(f"✓ Completed updates for task field {pm_field}")
+                    robust_put(put_url, headers, {"value": value}, logger)
 
         logger.info(f"=== Finished project {short_code} ===\n")
 
-
+# ----------------------------
+# RUN CP TO PMCOM
+# ----------------------------
 def run_cp_to_pmcom(filters=None, not_allowed_statuses=None, debug=False):
     logger, upload_log = setup_blob_logger(prefix="pm_update_log")
-
-    invocation_id = str(uuid.uuid4())
-    instance = os.environ.get("WEBSITE_INSTANCE_ID", "local")
-    logger.info(f"PMCOM START | instance={instance} | invocation={invocation_id}")
-
-    # ----------------------------
-    # Debug: list all PMCOM fields
-    # ----------------------------
-    if debug and logger:
-        field_ids = load_project_field_ids()
-        logger.info("PMCOM project fields currently available:")
-        for name, fid in field_ids.items():
-            logger.info(f"  {name} → {fid}")
-
     try:
-        logger.info("=== CP → PMCOM Update Started ===")
-        logger.info(f"Start time: {datetime.now()}")
-
         if not not_allowed_statuses:
             not_allowed_statuses = ["Closed"]
-
-        logger.info(f"Filters: {filters}, Not Allowed Statuses: {not_allowed_statuses}, Debug: {debug}")
-
-        # Load data dictionary
         data_dict = load_data_dictionary(logger)
-
-        # Read CP Excel
         projects = filterCPProjectsToUpdate(data_dict, filters=filters, debug=debug, logger=logger)
-
-        # Update PMCOM
-        update_pmcom_matching_projects(
-            projects,
-            data_dict,
-            not_allowed_statuses=not_allowed_statuses,
-            debug=debug,
-            logger=logger
-        )
-
-        logger.info(f"Finished CP → PMCOM update. Total projects processed: {len(projects)}")
-
-    except Exception as e:
-        logger.exception(f"❌ CP → PMCOM update failed: {e}")
-
+        update_pmcom_matching_projects(projects, data_dict, not_allowed_statuses, debug, logger)
     finally:
-        logger.info(f"End time: {datetime.now()}")
         upload_log()
 
 
@@ -733,36 +516,30 @@ def run_cp_to_pmcom(filters=None, not_allowed_statuses=None, debug=False):
 # =====================
 app = func.FunctionApp()
 
+# ============================
+# UPDATED PMCOM HTTP FUNCTION
+# (drop-in replacement ONLY)
+# ============================
+
+PMCOM_QUEUE_NAME = "cp-pmcom-queue"
 
 @app.function_name(name="CostpointToPMcom")
-@app.route(route="CostpointToPMcom", methods=["POST", "GET"])  # HTTP trigger
+@app.route(route="CostpointToPMcom", methods=["POST", "GET"])
 def CostpointToPMcom(req: func.HttpRequest):
     # -------------------------
     # GET → describe function
     # -------------------------
-
     if req.method == "GET":
         df = read_excel_from_blob(BLOB_NAME_A1, logger=bootstrap_logger)
         cp_columns = list(df.columns)
 
         return func.HttpResponse(
             json.dumps({
-                "description": "Update PM.com projects from CP Excel feed",
+                "description": "Queue CP → PM.com update job",
                 "available_filters": cp_columns,
                 "filter_syntax": "FieldName=Value or FieldName=%partial%",
-                "examples": {
-                    "filters": [
-                        "Project Manager Name=%Lendo%",
-                        "Opportunity ID=0140045"
-                    ],
-                    "not_allowed_statuses": [
-                        "Closed"
-                    ]
-                },
                 "defaults": {
-                    "not_allowed_statuses": [
-                        "Closed"
-                    ],
+                    "not_allowed_statuses": ["Closed"],
                     "debug": False
                 }
             }, indent=2),
@@ -770,24 +547,74 @@ def CostpointToPMcom(req: func.HttpRequest):
             status_code=200
         )
 
-    # optional: read query params or JSON payload
-    if req.method == "POST":
-        data = req.get_json()
-        filters = data.get("filters")
-        not_allowed_statuses = data.get("not_allowed_statuses")
-        debug = data.get("debug", False)
+    # -------------------------
+    # POST → enqueue PMCOM job
+    # -------------------------
+    data = req.get_json()
+    payload = {
+        "filters": data.get("filters"),
+        "not_allowed_statuses": data.get("not_allowed_statuses"),
+        "debug": data.get("debug", False)
+    }
 
-        run_cp_to_pmcom(
-            filters=filters,
-            not_allowed_statuses=not_allowed_statuses,
-            debug=debug
-        )
+    encoded_message = base64.b64encode(
+        json.dumps(payload).encode("utf-8")
+    ).decode("utf-8")
 
-    return func.HttpResponse(
-        "CP to PMCOM processing triggered successfully.",
-        status_code=200
+    queue_client = QueueClient.from_connection_string(
+        STORAGE_CONN_STR,
+        PMCOM_QUEUE_NAME
+    )
+    queue_client.send_message(encoded_message)
+
+    bootstrap_logger.info(
+        f"PMCOM job queued to {PMCOM_QUEUE_NAME}: {payload}"
     )
 
+    return func.HttpResponse(
+        "CP → PM.com job queued",
+        status_code=202
+    )
+
+# ============================
+# NEW PMCOM QUEUE FUNCTION
+# (drop-in addition ONLY)
+# ============================
+
+@app.function_name(name="CostpointToPMcomQueue")
+@app.queue_trigger(
+    arg_name="msg",
+    queue_name="cp-pmcom-queue",
+    connection="AzureWebJobsStorage"
+)
+def CostpointToPMcomQueue(msg: func.QueueMessage):
+    """
+    Queue-triggered CP → PM.com processor.
+    Message JSON:
+      {
+        "filters": [...],
+        "not_allowed_statuses": [...],
+        "debug": false
+      }
+    """
+    try:
+        payload = json.loads(msg.get_body().decode("utf-8"))
+
+        bootstrap_logger.info(
+            f"PMCOM queue message received: {payload}"
+        )
+
+        run_cp_to_pmcom(
+            filters=payload.get("filters"),
+            not_allowed_statuses=payload.get("not_allowed_statuses"),
+            debug=payload.get("debug", False)
+        )
+
+    except Exception as e:
+        bootstrap_logger.exception(
+            f"❌ PMCOM queue processing failed: {e}"
+        )
+        raise  # poison-queue on failure
 
 # =====================
 # SMARTSHEET IMPORT
@@ -991,7 +818,7 @@ if __name__ == "__main__":
 
     # =====================
     # RUN SMARTSHEET UPDATE A1
-    # # =====================
+    # =====================
     if not UPDATE_PMCOMONLY:
         try:
             run_cp_to_smartsheet(
@@ -1001,7 +828,7 @@ if __name__ == "__main__":
             )
         except Exception as e:
             bootstrap_logger.error(f"❌ Smartsheet A1 update failed: {e}", exc_info=True)
-
+    
         # =====================
         # RUN SMARTSHEET UPDATE A4
         # =====================
