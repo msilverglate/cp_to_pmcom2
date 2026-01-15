@@ -11,9 +11,9 @@ import smartsheet
 import logging
 import uuid
 import base64
-from logging_utils import setup_blob_logger
-from excel_utils import read_excel_from_blob
-from smartsheet_utils import clear_smartsheet, reduce_columns
+from utils1.logging_utils import setup_blob_logger
+from utils1.excel_utils import read_excel_from_blob
+from utils1.smartsheet_utils import clear_smartsheet, reduce_columns
 from azure.storage.queue import QueueClient
 
 logging.basicConfig(
