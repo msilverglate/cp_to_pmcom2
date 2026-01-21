@@ -1,4 +1,4 @@
-## Version 2.52 (with robust PM.com session for DNS/network retries)
+## Version 2.53 (moved SS Utils back inside main function, added simple counters for proj native/custom, tasks updated)
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -8,6 +8,7 @@ from requests.exceptions import ConnectionError, HTTPError
 
 import re
 import pandas as pd
+import numpy as np
 from datetime import datetime, timedelta
 import json
 import os
@@ -18,9 +19,7 @@ import uuid
 import base64
 from utils1.logging_utils import setup_blob_logger
 from utils1.excel_utils import read_excel_from_blob
-from utils1.smartsheet_utils import clear_smartsheet, reduce_columns
 from azure.storage.queue import QueueClient
-import time
 from dateutil.parser import parse
 from dateutil.tz import tzutc
 
@@ -57,16 +56,17 @@ headers = {
 # ----------------------------
 session = requests.Session()
 retry_strategy = Retry(
-    total=10,               # total retries for all errors
-    connect=5,              # retries specifically for connection errors (DNS)
-    read=3,                 # retries for read errors
-    backoff_factor=1,       # exponential backoff 1s, 2s, 4s...
+    total=10,  # total retries for all errors
+    connect=5,  # retries specifically for connection errors (DNS)
+    read=3,  # retries for read errors
+    backoff_factor=1,  # exponential backoff 1s, 2s, 4s...
     status_forcelist=[429, 500, 502, 503, 504],
     allowed_methods=["GET", "PUT", "POST"]
 )
 adapter = HTTPAdapter(max_retries=retry_strategy)
 session.mount("https://", adapter)
 session.mount("http://", adapter)
+
 
 def robust_get(url, headers, logger, timeout=30):
     try:
@@ -83,6 +83,7 @@ def robust_get(url, headers, logger, timeout=30):
         logger.error(f"HTTP error {e.response.status_code} for {url}")
         raise
 
+
 def robust_put(url, headers, payload, logger, timeout=30):
     try:
         resp = session.put(url, headers=headers, json=payload, timeout=timeout)
@@ -97,6 +98,7 @@ def robust_put(url, headers, payload, logger, timeout=30):
     except HTTPError as e:
         logger.error(f"HTTP error {e.response.status_code} for {url}")
         raise
+
 
 # ----------------------------
 # DATA DICTIONARY
@@ -186,6 +188,7 @@ DEFAULT_DATA_DICTIONARY = '''
 
 '''
 
+
 # ----------------------------
 # TRANSFORMS
 # ----------------------------
@@ -195,11 +198,13 @@ def regex_left_of_dot(text):
     m = re.match(r"([^.]+)", text)
     return m.group(1) if m else text
 
+
 def regex_left_of_last_dot(value):
     if not isinstance(value, str):
         return value
     match = re.match(r"^(.*)\.[^.]+$", value)
     return match.group(1) if match else value
+
 
 def transform_value(rule, value):
     if value is None or pd.isna(value) or str(value).strip() == "":
@@ -227,6 +232,7 @@ def transform_value(rule, value):
         except Exception:
             return None
     return value
+
 
 # ----------------------------
 # LOAD DATA DICTIONARY
@@ -259,6 +265,7 @@ def load_data_dictionary(logger):
         data_dict = json.loads(DEFAULT_DATA_DICTIONARY)
         return data_dict
 
+
 def get_project_status(response_json):
     if not response_json or "data" not in response_json:
         return None
@@ -268,6 +275,7 @@ def get_project_status(response_json):
     project = data[0]
     status = project.get("status", {})
     return status.get("name")
+
 
 # ----------------------------
 # APPLY LEVEL 6 HOURS (same as before)
@@ -335,8 +343,9 @@ def filterCPProjectsToUpdate(data_dict, filters=None, debug=False, logger=None):
         (df["Opportunity ID"].notna()) &
         (df["Level Number"] == 5) &
         (~df["Opportunity ID"].isin(excluded_ids)) &
-        ((df["PJ UDEF Date 1"].isna()) | (df["PJ UDEF Date 1"].astype(str).str.strip() == "") | (df["PJ UDEF Date 1"] > threshold_date))
-    ]
+        ((df["PJ UDEF Date 1"].isna()) | (df["PJ UDEF Date 1"].astype(str).str.strip() == "") | (
+                    df["PJ UDEF Date 1"] > threshold_date))
+        ]
     if filters:
         for filter_expr in filters:
             column_name, raw_pattern = filter_expr.split("=", 1)
@@ -349,7 +358,8 @@ def filterCPProjectsToUpdate(data_dict, filters=None, debug=False, logger=None):
             compiled_regex = re.compile(regex_pattern, re.IGNORECASE)
             filtered_df = filtered_df[filtered_df[column_name].apply(lambda v: bool(compiled_regex.search(str(v))))]
             if debug:
-                logger.info("[FILTER DEBUG] Applied filter: %s LIKE %s, remaining rows: %d", column_name, regex_pattern, len(filtered_df))
+                logger.info("[FILTER DEBUG] Applied filter: %s LIKE %s, remaining rows: %d", column_name, regex_pattern,
+                            len(filtered_df))
     projects_to_update = []
     for _, row in filtered_df.iterrows():
         project_data = {}
@@ -367,6 +377,7 @@ def filterCPProjectsToUpdate(data_dict, filters=None, debug=False, logger=None):
     logger.info("Filtered rows: %d", len(projects_to_update))
     return projects_to_update
 
+
 # ----------------------------
 # LOAD FIELD IDS
 # ----------------------------
@@ -376,16 +387,19 @@ def load_project_field_ids():
     fields = resp.get("data", [])
     return {f["name"].strip().lower(): f["id"] for f in fields}
 
+
 def load_task_field_ids(project_id):
     url = f"{BASE_URL}/projects/{project_id}/tasks/fields"
     resp = robust_get(url, headers, bootstrap_logger)
     fields = resp.get("data", [])
     return {f["name"].strip().lower(): f["id"] for f in fields}
 
+
 def load_project_tasks(project_id, logger):
     url = f"{BASE_URL}/tasks?%24filter=projectId%20eq%20{project_id}"
     resp = robust_get(url, headers, logger)
     return resp.get("data", [])
+
 
 def get_task_field_value(task_id, field_id, logger):
     url = f"{BASE_URL}/tasks/{task_id}/fields/{field_id}/values"
@@ -396,6 +410,7 @@ def get_task_field_value(task_id, field_id, logger):
     elif isinstance(data, dict):
         return data.get("value")
     return None
+
 
 # ----------------------------
 # UPDATE PMCOM MATCHING PROJECTS
@@ -417,7 +432,10 @@ def update_pmcom_matching_projects(projects, data_dict, not_allowed_statuses, de
         project_id = project["id"]
         project_name = project["name"]
 
-        # time.sleep(1)  # throttle only here if desired
+        # Update counters (per project)
+        proj_native_updates = 0
+        proj_custom_updates = 0
+        task_updates = 0
 
         status_name = get_project_status(resp_json)
         normalized_status = (status_name or "").strip()
@@ -433,7 +451,8 @@ def update_pmcom_matching_projects(projects, data_dict, not_allowed_statuses, de
         sheet_ts_dt = parse(sheet_ts_raw) if sheet_ts_raw else None
         if sheet_ts_dt and sheet_ts_dt.tzinfo is None:
             sheet_ts_dt = sheet_ts_dt.replace(tzinfo=tzutc())
-        pm_ts_str = next((f["value"] for f in project.get("fieldValues", []) if f.get("name") == "CP Update Timestamp"), None)
+        pm_ts_str = next((f["value"] for f in project.get("fieldValues", []) if f.get("name") == "CP Update Timestamp"),
+                         None)
         pm_ts_dt = parse(pm_ts_str) if pm_ts_str else None
         cp_data_is_new = not pm_ts_dt or sheet_ts_dt > pm_ts_dt
 
@@ -464,6 +483,8 @@ def update_pmcom_matching_projects(projects, data_dict, not_allowed_statuses, de
                     continue
                 put_url = f"{BASE_URL}/projects/{project_id}"
                 robust_put(put_url, headers, {pm_field: value}, logger)
+                proj_native_updates += 1
+
 
             # PROJ CUSTOM FIELD
             elif field_type == "ProjCustom":
@@ -479,6 +500,8 @@ def update_pmcom_matching_projects(projects, data_dict, not_allowed_statuses, de
                         continue
                 put_url = f"{BASE_URL}/projects/{project_id}/fields/{field_id}"
                 robust_put(put_url, headers, {"value": value}, logger)
+                proj_custom_updates += 1
+
 
             # TASK CUSTOM FIELD
             elif field_type == "TaskCustom":
@@ -493,8 +516,19 @@ def update_pmcom_matching_projects(projects, data_dict, not_allowed_statuses, de
                         continue
                     put_url = f"{BASE_URL}/tasks/{task_id}/fields/{field_id}/values"
                     robust_put(put_url, headers, {"value": value}, logger)
+                    task_updates += 1
+
+        # Minimal per-project update summary
+        if proj_native_updates or proj_custom_updates or task_updates:
+            logger.info(
+                f"✔ Updates applied for {short_code} | "
+                f"Project Native: {proj_native_updates}, "
+                f"Project Custom: {proj_custom_updates}, "
+                f"Tasks: {task_updates}"
+            )
 
         logger.info(f"=== Finished project {short_code} ===\n")
+
 
 # ----------------------------
 # RUN CP TO PMCOM
@@ -522,6 +556,7 @@ app = func.FunctionApp()
 # ============================
 
 PMCOM_QUEUE_NAME = "cp-pmcom-queue"
+
 
 @app.function_name(name="CostpointToPMcom")
 @app.route(route="CostpointToPMcom", methods=["POST", "GET"])
@@ -576,6 +611,7 @@ def CostpointToPMcom(req: func.HttpRequest):
         status_code=202
     )
 
+
 # ============================
 # NEW PMCOM QUEUE FUNCTION
 # (drop-in addition ONLY)
@@ -616,9 +652,40 @@ def CostpointToPMcomQueue(msg: func.QueueMessage):
         )
         raise  # poison-queue on failure
 
+
 # =====================
 # SMARTSHEET IMPORT
 # =====================
+
+# =====================
+# SMARTSHEET UTILS
+# =====================
+
+def clear_smartsheet(sheet, smartsheet_client, logger):
+    row_ids = [row.id for row in sheet.rows]
+    total_rows = len(row_ids)
+    logger.info(f"Starting to clear {total_rows} rows from Smartsheet...")
+
+    CHUNK_SIZE = 400
+    deleted_count = 0
+
+    for i in range(0, total_rows, CHUNK_SIZE):
+        chunk = row_ids[i:i + CHUNK_SIZE]
+        smartsheet_client.Sheets.delete_rows(sheet.id, chunk)
+        deleted_count += len(chunk)
+        logger.info(f"Deleted {len(chunk)} rows in this chunk. Total deleted so far: {deleted_count}/{total_rows}")
+
+    logger.info(f"Completed clearing rows. Total deleted: {deleted_count}")
+
+
+def reduce_columns(df, allowed_columns):
+    df1 = df[sorted(allowed_columns)].copy()
+    for col in ["PJ UDEF Date 1", "End Date", "Project Start Date"]:
+        if col in df1.columns:
+            df1[col] = df1[col].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    df1.replace({np.nan: ""}, inplace=True)
+    return df1
+
 
 def run_cp_to_smartsheet(sheet_id: int, blob_name: str, debug=False):
     logger, upload_log = setup_blob_logger(prefix=f"smartsheet_update_log_{blob_name}")
@@ -691,10 +758,8 @@ def run_cp_to_smartsheet(sheet_id: int, blob_name: str, debug=False):
         upload_log()
 
 
-#  from function_app import run_cp_to_smartsheet  # adjust import as needed
-
 # ---------------------------
-# Queue-triggered function
+# Smartsheet Update Queue-triggered function
 # ---------------------------
 @app.function_name(name="CostpointToSmartsheetQueue")
 @app.queue_trigger(
@@ -724,10 +789,9 @@ def CostpointToSmartsheetQueue(msg: func.QueueMessage):
 
 
 # ---------------------------
-# HTTP-triggered function to enqueue messages
+# Smartsheet Update HTTP-triggered function to enqueue messages
 # ---------------------------
 QUEUE_NAME = "cp-smartsheet-queue"
-
 
 @app.function_name(name="CostpointToSmartsheet")
 @app.route(route="CostpointToSmartsheet", methods=["POST"])
@@ -828,7 +892,7 @@ if __name__ == "__main__":
             )
         except Exception as e:
             bootstrap_logger.error(f"❌ Smartsheet A1 update failed: {e}", exc_info=True)
-    
+
         # =====================
         # RUN SMARTSHEET UPDATE A4
         # =====================
