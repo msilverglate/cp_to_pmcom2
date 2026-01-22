@@ -1,4 +1,4 @@
-## Version 2.53 (moved SS Utils back inside main function, added simple counters for proj native/custom, tasks updated)
+## Version 2.6 (pull hour data from separate Project Data 1CA.xlsx file and revert to Project Data 1.xlsx)
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -36,7 +36,7 @@ bootstrap_logger = logging.getLogger("bootstrap")
 # CONFIG
 # ----------------------------
 BLOB_CONTAINER = os.environ.get("BLOB_CONTAINER_NAME", "blob1")
-BLOB_NAME_A1 = os.environ.get("BLOB_NAME_A1", "Project Data 2.xlsx")
+BLOB_NAME_A1 = os.environ.get("BLOB_NAME_A1", "Project Data 1.xlsx")
 BLOB_NAME_A4 = os.environ.get("BLOB_NAME_A4", "Project Data 1CA.xlsx")
 STORAGE_CONN_STR = os.environ["AzureWebJobsStorage"]
 
@@ -278,54 +278,98 @@ def get_project_status(response_json):
 
 
 # ----------------------------
-# APPLY LEVEL 6 HOURS (same as before)
+# APPLY LEVEL 6 HOURS 
 # ----------------------------
 
-def apply_level6_hours_to_pm_fields(df, logger, debug=False):
+def load_level6_hours_from_excel(blob_name, logger):
     """
-    Updates a DataFrame by placing Level 6 'Entered Hours' into PM-specific columns,
-    then rolls up sums into the Level 5 parent project rows.
+    Reads Level 6 hours from an Excel blob and aggregates them to Level 5.
 
-    pm_fields: dict mapping Level 6 suffix to DataFrame column name
-        e.g., {"ENG": "CP ENG ACT HRS", "PM1": "CP PM1 ACT HRS", ...}
+    Returns:
+        {
+            level5_project_id: {
+                "ENG": hours,
+                "PM1": hours,
+                "DNB": hours,
+                "TRV": hours,
+                ...
+            }
+        }
     """
+    pm_suffixes = {"ENG", "PM1", "DNB", "TRV", "ODC", "SUB"}
+    agg = {}
+
+    df_lvl6 = read_excel_from_blob(blob_name, logger)
+
+    for _, row in df_lvl6.iterrows():
+        project_id = str(row.get("Project ID", "")).strip()
+        hours = row.get("Entered Hours", 0.0)
+
+        if not project_id:
+            continue
+
+        try:
+            hours = float(hours)
+        except (TypeError, ValueError):
+            hours = 0.0
+
+        tokens = project_id.split(".")
+        if len(tokens) < 2:
+            continue
+
+        suffix = tokens[-1]
+        if suffix not in pm_suffixes:
+            continue
+
+        level5_pid = ".".join(tokens[:-1])
+
+        agg.setdefault(level5_pid, {})
+        agg[level5_pid][suffix] = agg[level5_pid].get(suffix, 0.0) + hours
+
+    logger.info(f"Loaded Level 6 hours for {len(agg)} Level 5 projects")
+    return agg
+
+
+def apply_level6_hours_to_pm_fields(
+    df,
+    level6_blob_name,
+    logger,
+    debug=False
+):
+    """
+    Populates PM columns on Level 5 projects using a separate Level 6 Excel blob.
+    """
+
     pm_fields = {
         "ENG": "CP ENG ACT HRS",
         "PM1": "CP PM1 ACT HRS",
         "DNB": "CP DNB ACT HRS",
         "TRV": "CP TRV ACT HRS",
         "ODC": "CP ODC ACT HRS",
-        "SUB": "CP SUB ACT HRS"
+        "SUB": "CP SUB ACT HRS",
     }
 
-    # 1️⃣ Assign Level 6 Entered Hours to PM columns
-    level6_pattern = re.compile(r"^(?:[^.]+\.){5}([A-Z0-9]+)$")  # last group after 5 dots
+    # Ensure columns exist
+    for col in pm_fields.values():
+        if col not in df.columns:
+            df[col] = 0.0
 
-    for idx, row in df.iterrows():
-        match = level6_pattern.match(row["Project ID"])
-        if not match:
-            continue  # skip non-Level6
+    # Load Level 6 data from Excel blob
+    level6_hours = load_level6_hours_from_excel(level6_blob_name, logger)
 
-        suffix = match.group(1)
-        if suffix in pm_fields:
-            # Safely set the value, defaulting to 0.0 if missing or NaN
-            entered_hours = row.get("Entered Hours", 0.0)
-            df.at[idx, pm_fields[suffix]] = 0.0 if pd.isna(entered_hours) else entered_hours
-            if debug:
-                logger.info(
-                    f"[DEBUG] Level 6 {row['Project ID']} -> {pm_fields[suffix]} = {df.at[idx, pm_fields[suffix]]}")
-
-    # 2️⃣ Roll up Level 6 hours into Level 5 projects
-    level5_df = df[df["Level Number"] == 5].copy()
-    for idx, row in level5_df.iterrows():
+    # Apply to Level 5 rows only
+    for idx, row in df[df["Level Number"] == 5].iterrows():
         pid = row["Project ID"]
-        # Find all Level 6 children of this Level 5 project
-        children = df[df["Project ID"].str.startswith(pid + ".")]
+        project_hours = level6_hours.get(pid, {})
+
         for suffix, col_name in pm_fields.items():
-            total = children[col_name].sum() if not children.empty else 0.0
-            df.at[idx, col_name] = total
-            if debug:
-                logger.info(f"[DEBUG] Level 5 {pid} roll-up -> {col_name} = {total}")
+            value = project_hours.get(suffix, 0.0)
+            df.at[idx, col_name] = value
+
+            if debug and value:
+                logger.info(
+                    f"[DEBUG] Level 5 {pid} <- {suffix} = {value}"
+                )
 
     return df
 
@@ -335,7 +379,7 @@ def apply_level6_hours_to_pm_fields(df, logger, debug=False):
 # ----------------------------
 def filterCPProjectsToUpdate(data_dict, filters=None, debug=False, logger=None):
     df = read_excel_from_blob(BLOB_NAME_A1, logger)
-    df = apply_level6_hours_to_pm_fields(df, logger, debug)
+    df = apply_level6_hours_to_pm_fields(df, BLOB_NAME_A4, logger)
     df["PJ UDEF Date 1"] = pd.to_datetime(df["PJ UDEF Date 1"], errors="coerce")
     threshold_date = datetime.now() - timedelta(days=30)
     excluded_ids = ["OP-0050475"]
