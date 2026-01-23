@@ -1,4 +1,4 @@
-## Version 2.6 (pull hour data from separate Project Data 1CA.xlsx file and revert to Project Data 1.xlsx)
+## Version 2.61 (Update robust GET to see 404 no value found for task/custom proj fields as blank)
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -71,6 +71,15 @@ session.mount("http://", adapter)
 def robust_get(url, headers, logger, timeout=30):
     try:
         resp = session.get(url, headers=headers, timeout=timeout)
+        if resp.status_code == 404:
+            try:
+                payload = resp.json()
+            except ValueError:
+                payload = {}
+            if payload.get("statusCode") == "NotFound":
+                logger.info(f"PM.com field has no value (treating as blank): {url}")
+                return {}  # Acts like blank / missing data
+            resp.raise_for_status()
         resp.raise_for_status()
         return resp.json()
     except ConnectionError as e:
