@@ -1,4 +1,4 @@
-## Version 2.61 (Update robust GET to see 404 no value found for task/custom proj fields as blank)
+## Version 2.62 broke out matching to pmcom in helper def that includes secondary match on project code
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -287,7 +287,7 @@ def get_project_status(response_json):
 
 
 # ----------------------------
-# APPLY LEVEL 6 HOURS 
+# APPLY LEVEL 6 HOURS
 # ----------------------------
 
 def load_level6_hours_from_excel(blob_name, logger):
@@ -464,24 +464,49 @@ def get_task_field_value(task_id, field_id, logger):
         return data.get("value")
     return None
 
+def pick_pmcom_project(data: list, cp_project_id: str, short_code: str, logger):
+    """Pick correct PM.com project when multiple rows returned for the same shortCode."""
+    if not data:
+        return None
+    if len(data) == 1:
+        return data[0]
+
+    logger.warning("Multiple PM.com projects returned for shortCode %s (%d rows)", short_code, len(data))
+    project = next(
+        (row for row in data if "chargeCode" in row and cp_project_id in row["chargeCode"].get("name", "")),
+        data[0]
+    )
+
+    if any("chargeCode" in row and cp_project_id in row["chargeCode"].get("name", "") for row in data):
+        logger.info("Matched PM.com project %s to CP Project ID %s via chargeCode", project["id"], cp_project_id)
+    else:
+        logger.warning("No PM.com project matched chargeCode for CP Project ID %s. Keeping first project: %s", cp_project_id, project.get("id"))
+
+    return project
+
 
 # ----------------------------
 # UPDATE PMCOM MATCHING PROJECTS
 # ----------------------------
+
 def update_pmcom_matching_projects(projects, data_dict, not_allowed_statuses, debug=False, logger=None):
     project_field_ids = load_project_field_ids()
     if debug:
         projects = projects[:2]
         logger.info(f"=== DEBUG MODE: Limiting to {len(projects)} project(s) ===")
+
     for i, proj in enumerate(projects, start=1):
         short_code = proj["shortCode"]
-        url = f"{BASE_URL}/projects?%24top=1&%24filter=shortCode%20eq%20'{short_code}'"
+        cp_project_id = proj["source_row"].get("Project ID")
+        url = f"{BASE_URL}/projects?%24top=10&%24filter=shortCode eq '{short_code}'"
         resp_json = robust_get(url, headers, logger)
         data = resp_json.get("data", [])
-        if not data:
-            logger.warning(f"No PM.com project found for shortCode {short_code}")
+
+        project = pick_pmcom_project(data, cp_project_id, short_code, logger)
+        if not project:
+            logger.warning("No PM.com project found for shortCode %s", short_code)
             continue
-        project = data[0]
+
         project_id = project["id"]
         project_name = project["name"]
 
@@ -581,7 +606,6 @@ def update_pmcom_matching_projects(projects, data_dict, not_allowed_statuses, de
             )
 
         logger.info(f"=== Finished project {short_code} ===\n")
-
 
 # ----------------------------
 # RUN CP TO PMCOM
@@ -904,7 +928,7 @@ if __name__ == "__main__":
     # =====================
     DEBUG = False
     UPDATE_PMCOMONLY = True
-    FILTERS = ["Project Manager Name=%Silverglate%"]  # e.g. ["PROJ_MGR_NAME=Russell"]
+    FILTERS = []  # e.g. ["PROJ_MGR_NAME=Russell"]
     NOT_ALLOWED_STATUSES = ["CLOSED"]  # e.g. ["CLOSED", "ON_HOLD"]
 
     # =====================
