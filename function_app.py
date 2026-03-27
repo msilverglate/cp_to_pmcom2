@@ -1,11 +1,6 @@
-## Version 2.62 broke out matching to pmcom in helper def that includes secondary match on project code
+## Version 2.63 Added in PTO Updates
 
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from urllib3.exceptions import NameResolutionError
-from requests.exceptions import ConnectionError, HTTPError
-
 import re
 import pandas as pd
 import numpy as np
@@ -18,7 +13,11 @@ import logging
 import uuid
 import base64
 from utils1.logging_utils import setup_blob_logger
+from utils1.cp_project_task_data_util import (load_project_tasks,
+                                              load_task_field_ids, load_project_field_ids,
+                                              pick_pmcom_project, get_project_status)
 from utils1.excel_utils import read_excel_from_blob
+from utils1.api_call_utils import robust_put, robust_get, robust_post, robust_delete
 from azure.storage.queue import QueueClient
 from dateutil.parser import parse
 from dateutil.tz import tzutc
@@ -30,6 +29,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
+
 bootstrap_logger = logging.getLogger("bootstrap")
 
 # ----------------------------
@@ -37,8 +37,10 @@ bootstrap_logger = logging.getLogger("bootstrap")
 # ----------------------------
 BLOB_CONTAINER = os.environ.get("BLOB_CONTAINER_NAME", "blob1")
 BLOB_NAME_A1 = os.environ.get("BLOB_NAME_A1", "Project Data 1.xlsx")
+BLOB_NAME_A2 = os.environ.get("BLOB_NAME_A2", "PTO CP to PMCOM.xlsx")
 BLOB_NAME_A4 = os.environ.get("BLOB_NAME_A4", "Project Data 1CA.xlsx")
 STORAGE_CONN_STR = os.environ["AzureWebJobsStorage"]
+PTO_PROJ_SHORTCODE = os.environ.get("PTO_PROJ_SHORTCODE","TimeOff")
 
 BASE_URL = "https://api.projectmanager.com/api/data"
 API_KEY = os.environ.get("PM_API_KEY")
@@ -50,64 +52,6 @@ headers = {
     "Accept": "application/json",
     "Content-Type": "application/json"
 }
-
-# ----------------------------
-# SETUP ROBUST SESSION FOR PM.COM API CALLS
-# ----------------------------
-session = requests.Session()
-retry_strategy = Retry(
-    total=10,  # total retries for all errors
-    connect=5,  # retries specifically for connection errors (DNS)
-    read=3,  # retries for read errors
-    backoff_factor=1,  # exponential backoff 1s, 2s, 4s...
-    status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=["GET", "PUT", "POST"]
-)
-adapter = HTTPAdapter(max_retries=retry_strategy)
-session.mount("https://", adapter)
-session.mount("http://", adapter)
-
-
-def robust_get(url, headers, logger, timeout=30):
-    try:
-        resp = session.get(url, headers=headers, timeout=timeout)
-        if resp.status_code == 404:
-            try:
-                payload = resp.json()
-            except ValueError:
-                payload = {}
-            if payload.get("statusCode") == "NotFound":
-                logger.info(f"PM.com field has no value (treating as blank): {url}")
-                return {}  # Acts like blank / missing data
-            resp.raise_for_status()
-        resp.raise_for_status()
-        return resp.json()
-    except ConnectionError as e:
-        if isinstance(e.__cause__, NameResolutionError):
-            logger.warning(f"Temporary DNS issue for {url}, will retry: {e}")
-            raise
-        else:
-            raise
-    except HTTPError as e:
-        logger.error(f"HTTP error {e.response.status_code} for {url}")
-        raise
-
-
-def robust_put(url, headers, payload, logger, timeout=30):
-    try:
-        resp = session.put(url, headers=headers, json=payload, timeout=timeout)
-        resp.raise_for_status()
-        return resp
-    except ConnectionError as e:
-        if isinstance(e.__cause__, NameResolutionError):
-            logger.warning(f"Temporary DNS issue for {url}, will retry: {e}")
-            raise
-        else:
-            raise
-    except HTTPError as e:
-        logger.error(f"HTTP error {e.response.status_code} for {url}")
-        raise
-
 
 # ----------------------------
 # DATA DICTIONARY
@@ -275,15 +219,6 @@ def load_data_dictionary(logger):
         return data_dict
 
 
-def get_project_status(response_json):
-    if not response_json or "data" not in response_json:
-        return None
-    data = response_json.get("data", [])
-    if not data:
-        return None
-    project = data[0]
-    status = project.get("status", {})
-    return status.get("name")
 
 
 # ----------------------------
@@ -432,65 +367,11 @@ def filterCPProjectsToUpdate(data_dict, filters=None, debug=False, logger=None):
 
 
 # ----------------------------
-# LOAD FIELD IDS
-# ----------------------------
-def load_project_field_ids():
-    url = f"{BASE_URL}/projects/fields"
-    resp = robust_get(url, headers, bootstrap_logger)
-    fields = resp.get("data", [])
-    return {f["name"].strip().lower(): f["id"] for f in fields}
-
-
-def load_task_field_ids(project_id):
-    url = f"{BASE_URL}/projects/{project_id}/tasks/fields"
-    resp = robust_get(url, headers, bootstrap_logger)
-    fields = resp.get("data", [])
-    return {f["name"].strip().lower(): f["id"] for f in fields}
-
-
-def load_project_tasks(project_id, logger):
-    url = f"{BASE_URL}/tasks?%24filter=projectId%20eq%20{project_id}"
-    resp = robust_get(url, headers, logger)
-    return resp.get("data", [])
-
-
-def get_task_field_value(task_id, field_id, logger):
-    url = f"{BASE_URL}/tasks/{task_id}/fields/{field_id}/values"
-    resp = robust_get(url, headers, logger)
-    data = resp.get("data")
-    if isinstance(data, list) and data:
-        return data[0].get("value")
-    elif isinstance(data, dict):
-        return data.get("value")
-    return None
-
-def pick_pmcom_project(data: list, cp_project_id: str, short_code: str, logger):
-    """Pick correct PM.com project when multiple rows returned for the same shortCode."""
-    if not data:
-        return None
-    if len(data) == 1:
-        return data[0]
-
-    logger.warning("Multiple PM.com projects returned for shortCode %s (%d rows)", short_code, len(data))
-    project = next(
-        (row for row in data if "chargeCode" in row and cp_project_id in row["chargeCode"].get("name", "")),
-        data[0]
-    )
-
-    if any("chargeCode" in row and cp_project_id in row["chargeCode"].get("name", "") for row in data):
-        logger.info("Matched PM.com project %s to CP Project ID %s via chargeCode", project["id"], cp_project_id)
-    else:
-        logger.warning("No PM.com project matched chargeCode for CP Project ID %s. Keeping first project: %s", cp_project_id, project.get("id"))
-
-    return project
-
-
-# ----------------------------
 # UPDATE PMCOM MATCHING PROJECTS
 # ----------------------------
 
 def update_pmcom_matching_projects(projects, data_dict, not_allowed_statuses, debug=False, logger=None):
-    project_field_ids = load_project_field_ids()
+    project_field_ids = load_project_field_ids(logger)
     if debug:
         projects = projects[:2]
         logger.info(f"=== DEBUG MODE: Limiting to {len(projects)} project(s) ===")
@@ -537,7 +418,7 @@ def update_pmcom_matching_projects(projects, data_dict, not_allowed_statuses, de
         tasks = load_project_tasks(project_id, logger)
         if debug:
             tasks = tasks[:10]
-        task_field_ids = load_task_field_ids(project_id)
+        task_field_ids = load_task_field_ids(project_id, logger)
         task_dict = {t["id"]: t for t in tasks}
         task_field_map = {}
         for t in tasks:
@@ -729,6 +610,237 @@ def CostpointToPMcomQueue(msg: func.QueueMessage):
         )
         raise  # poison-queue on failure
 
+# =====================
+# PTO IMPORT
+# =====================
+
+def format_date(dt):
+    return pd.to_datetime(dt).strftime("%Y-%m-%d")
+
+def get_project_id(short_code, logger):
+    url = f"{BASE_URL}/projects?%24top=10&%24filter=shortCode eq '{short_code}'"
+    resp_json = robust_get(url, headers, logger)
+    project = resp_json.get("data", [])
+    if not project:
+        return(logger.warning("No PM.com project found for shortCode %s", short_code))
+    project = project[0]
+    project_id = project["id"]
+    project_name = project["name"]
+    logger.info(f"PTO Project Name: {project_name} | PTO Project ID: {project_id}")
+    # breakpoint()
+    return(project_id, project_name)
+
+def delete_tasks(tasks, project_id, logger):
+    for task in tasks:
+        task_project_id = task.get("projectId")
+        # Safety check
+        if task_project_id != project_id:
+            logger.warning(
+                f"Skipping task {task.get('id')} - belongs to different project: {task_project_id}"
+            )
+            continue
+        task_id = task.get("id")
+        delete_url = f"{BASE_URL}/tasks/{task_id}"
+        logger.debug(f"Deleting task {task_id} from project {project_id}")
+        resp = robust_delete(delete_url, headers=headers, logger=logger)
+
+
+def create_tasks_and_update_df(df, project_id, headers, logger):
+    df["task_id"] = None
+    url = f"https://api.projectmanager.com/api/data/projects/{project_id}/tasks"
+
+    for idx, row in df.iterrows():
+        start_date = format_date(row["SCHEDULE_DT"])
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d").date()
+        today = datetime.today().date()
+        percent_complete = 0 if start_dt > today else 100
+
+        payload = {
+            "name": "PTO",
+            "plannedStartDate": start_date,
+            "plannedFinishDate": start_date,
+            "plannedEffort": int(row["LEAVE_HRS"] * 60),
+            # "approvalStatus": row["REQUEST_STATUS"],
+            "percentComplete": percent_complete
+        }
+
+        r = robust_post(url, payload=payload, headers=headers, logger=logger)
+        r.raise_for_status()
+        response = r.json()
+        # Put task_id back into df so we can assign resource based on lookup
+        task_id = response["data"]["id"]
+        df.at[idx, "task_id"] = task_id
+
+    logger.info(f"\n{df.head(10)}")
+    return df
+
+# TODO Put this in a file anyone can edit and upload to blob
+NAME_TRANSLATIONS = {
+    "samuel palatucci": "sam palatucci",
+    "daniel bender": "dan bender",
+    "christopher dixon": "chris dixon",
+    "christopher russell": "chris russell",
+    "michael silverglate": "mike silverglate",
+    "peter pavlovich": "pete pavlovich"
+    # add more as needed
+}
+
+def translate_name(name, logger=None):
+    normalized = " ".join(name.strip().lower().split())
+    translated = NAME_TRANSLATIONS.get(normalized, normalized)
+    if logger and normalized != translated:
+        logger.info(f"Name translated: '{normalized}' → '{translated}'")
+
+    return translated
+
+def get_resource_lookup(logger):
+    url = f"{BASE_URL}/resources"
+    r = requests.get(url, headers=headers)
+    r.raise_for_status()
+    data = r.json()
+    # Adjust depending on response shape (data vs direct list)
+    resources = data.get("data", data)
+    lookup = {}
+    for r in resources:
+        name = r.get("name")
+        if name:
+            lookup[name.strip()] = r.get("id")
+
+    return lookup
+
+def build_normalized_lookup(resource_lookup, logger):
+    lookup = {}
+    for name, rid in resource_lookup.items():
+        normalized_name = name.strip().lower()
+        lookup[normalized_name] = rid
+        logger.debug(f"Resource mapping → Name: {name} | Normalized: {normalized_name} | ID: {rid}")
+
+    return lookup
+
+def assign_from_df(df, headers, logger):
+
+    for _, row in df.iterrows():
+        resource_id = row.get("resource_id")
+        if not resource_id:
+            logger.warning(f"Skipping row — no resource_id for {row.get('EMPLOYEE_NAME')}")
+            continue
+        payload = [{"id": resource_id}]
+        url = f"https://api.projectmanager.com/api/data/tasks/{row['task_id']}/assignees"
+        logger.debug(f"Assigning {resource_id} to task {row['task_id']}")
+
+        try:
+            robust_put(url, headers=headers, payload=payload, logger=logger)
+        except Exception as e:
+            logger.error(f"❌ Failed assigning {resource_id} to task {row['task_id']}: {e}")
+
+
+def run_cp_to_pmcom_PTO(debug=False):
+    logger, upload_log = setup_blob_logger(
+        prefix=f"cp_to_pmcom_PTO_update_log_", debug=debug
+    )
+
+    try:
+        project_id, project_name = get_project_id(PTO_PROJ_SHORTCODE, logger)
+
+        logger.info("Getting existing PTO tasks...")
+        existing_tasks = load_project_tasks(project_id, logger)
+
+        logger.info("Deleting old PTO tasks...")
+        delete_tasks(existing_tasks, project_id, logger)
+
+        logger.info("Get data from CP PTO Report")
+        df = read_excel_from_blob(BLOB_NAME_A2, logger=logger)
+
+        logger.info("Building new PTO tasks and assigning resources")
+        df["task_id"] = None
+        df = create_tasks_and_update_df(df, project_id, headers, logger)
+
+        resource_lookup = get_resource_lookup(logger)
+        normalized_lookup = build_normalized_lookup(resource_lookup, logger)
+
+        df["resource_id"] = df["EMPLOYEE_NAME"].apply(
+            lambda x: normalized_lookup.get(
+                NAME_TRANSLATIONS.get(
+                    " ".join(x.strip().lower().split()),
+                    " ".join(x.strip().lower().split())
+                )
+            )
+        )
+
+        assign_from_df(df, headers, logger)
+
+        logger.info("PTO refresh complete.")
+
+        return {"status": "success"}
+
+    except Exception as e:
+        logger.exception("PTO refresh failed")
+        return {"status": "failure", "error": str(e)}
+
+    finally:
+        upload_log()
+
+@app.function_name(name="CostpointToPMcomPTO")
+@app.route(route="CostpointToPMcomPTO", methods=["POST", "GET"])  # HTTP trigger
+def CostpointToPMcomPTO(req: func.HttpRequest):
+
+    import json
+
+    # -------------------------
+    # GET → describe function
+    # -------------------------
+    if req.method == "GET":
+        return func.HttpResponse(
+            json.dumps({
+                "description": "Update PM.com PTO project from CP Excel feed",
+                "usage": {
+                    "POST body or query param": {
+                        "debug": "true | false"
+                    }
+                }
+            }, indent=2),
+            mimetype="application/json",
+            status_code=200
+        )
+
+    if req.method == "POST":
+
+        debug = False
+
+        debug_param = req.params.get("debug")
+
+        try:
+            data = req.get_json()
+        except ValueError:
+            data = {}
+
+        if not debug_param and data:
+            debug_param = data.get("debug")
+
+        if isinstance(debug_param, str):
+            debug = debug_param.lower() == "true"
+        elif isinstance(debug_param, bool):
+            debug = debug_param
+
+        try:
+            result = run_cp_to_pmcom_PTO(debug=debug)
+
+            return func.HttpResponse(
+                f"CP to PMCOM PTO processing completed. Debug={debug}, Result={result}",
+                status_code=200
+            )
+
+        except Exception as e:
+            return func.HttpResponse(
+                f"CP to PMCOM PTO processing failed: {str(e)}",
+                status_code=500
+            )
+
+    # Unsupported method
+    return func.HttpResponse(
+        "Method not allowed",
+        status_code=405
+    )
 
 # =====================
 # SMARTSHEET IMPORT
@@ -956,6 +1068,13 @@ if __name__ == "__main__":
         )
     except Exception as e:
         bootstrap_logger.error(f"❌ PM.com update failed: {e}", exc_info=True)
+
+    try:
+        run_cp_to_pmcom_PTO(
+            debug=DEBUG
+        )
+    except Exception as e:
+        bootstrap_logger.error(f"❌ PM.com PTO update failed: {e}", exc_info=True)
 
     # =====================
     # RUN SMARTSHEET UPDATE A1
