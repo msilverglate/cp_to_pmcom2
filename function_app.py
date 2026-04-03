@@ -1,4 +1,4 @@
-## Version 2.63 Added in PTO Updates
+## Version 2.7 Includes As Sold Cost and As Sold Revenue
 
 import requests
 import re
@@ -136,10 +136,27 @@ DEFAULT_DATA_DICTIONARY = '''
     "pm_field": "CP DNB ACT HRS",
     "update": "Always",
     "transform": null
-  }
+  },
+  
+    "cpAsSoldCost": {
+    "cp_source": "Cost Funded",
+    "field_type": "ProjCustom",
+    "pm_field": "As Sold Cost",
+    "update": "Always",
+    "transform": null
+    },
+    
+    "cpAsSoldRev": {
+    "cp_source": "Total Funded",
+    "field_type": "ProjCustom",
+    "pm_field": "As Sold Rev",
+    "update": "Always",
+    "transform": null
+    }
 }
 
 '''
+
 
 
 # ----------------------------

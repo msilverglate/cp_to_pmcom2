@@ -16,5 +16,14 @@
     "queues": {
       "messageEncoding": "base64"
     }
+  },
+    "functionTimeout": "00:10:00",
+    "extensions": {
+      "queues": {
+        "visibilityTimeout": "00:10:00",
+        "batchSize": 1,
+        "newBatchThreshold": 0,
+        "maxDequeueCount": 5
+      }
   }
 }
