@@ -162,6 +162,7 @@ DEFAULT_DATA_DICTIONARY = '''
 # ----------------------------
 # TRANSFORMS
 # ----------------------------
+# TODO: Move all data dictionary to new util file
 def regex_left_of_dot(text):
     if not text:
         return text
@@ -696,9 +697,10 @@ NAME_TRANSLATIONS = {
     "samuel palatucci": "sam palatucci",
     "daniel bender": "dan bender",
     "christopher dixon": "chris dixon",
-    "christopher russell": "chris russell",
+    "christopher russell": "(rs) chris russell",
     "michael silverglate": "mike silverglate",
-    "peter pavlovich": "pete pavlovich"
+    "peter pavlovich": "pete pavlovich",
+    "rostislav veniaminov": "slava veniaminov"
     # add more as needed
 }
 
