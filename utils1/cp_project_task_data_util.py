@@ -7,12 +7,6 @@ from utils1.api_call_utils import robust_get
 # ----------------------------
 # CONFIG
 # ----------------------------
-BLOB_CONTAINER = os.environ.get("BLOB_CONTAINER_NAME", "blob1")
-BLOB_NAME_A1 = os.environ.get("BLOB_NAME_A1", "Project Data 1.xlsx")
-BLOB_NAME_A2 = os.environ.get("BLOB_NAME_A2", "PTO CP to PMCOM.xlsx")
-BLOB_NAME_A4 = os.environ.get("BLOB_NAME_A4", "Project Data 1CA.xlsx")
-STORAGE_CONN_STR = os.environ["AzureWebJobsStorage"]
-PTO_PROJ_SHORTCODE = os.environ.get("PTO_PROJ_SHORTCODE","CopyPTO")
 
 BASE_URL = "https://api.projectmanager.com/api/data"
 API_KEY = os.environ.get("PM_API_KEY")
